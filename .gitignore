@@ -1,0 +1,14 @@
+# 隐私凭据与账号
+session_state.json
+debug.log
+*.log
+
+# 任务导出与生成文件
+jobs/
+封存/
+__pycache__/
+*.pyc
+
+# 临时系统文件
+.DS_Store
+Thumbs.db
