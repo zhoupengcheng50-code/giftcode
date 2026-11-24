@@ -683,31 +683,33 @@ class GiftCodeAutomator:
     @staticmethod
     def activation_list(ctx):
         return evaluate_gms(ctx, r"""
-            const cards = visibleGrids().filter(grid => {
+            const cards = Array.from(document.querySelectorAll('.d-grid')).filter(grid => {
                 const header = gridHeaders(grid);
                 return /激活码/.test(header) && /创建时间|批次号|失效时间/.test(header);
             });
             if (cards.length !== 1) return null;
             const grid = cards[0];
             let panel = grid;
-            while (panel.parentElement && panel.parentElement.querySelectorAll('.d-grid').length === 1) {
+            while (panel.parentElement && panel.tagName !== 'BODY') {
                 if (/导出\s*Excel/.test(panel.innerText) && /生成/.test(panel.innerText)) break;
                 panel = panel.parentElement;
             }
             if (panel.querySelector('.d-loading:not([style*="display: none"]), .d-list-loading:not([style*="display: none"])')
                 && [...panel.querySelectorAll('.d-loading, .d-list-loading')].some(node => node.getClientRects().length)) return null;
-            const totals = [...panel.innerText.matchAll(/([0-9][0-9,]*)\s*(?:笔|条)\s*记录/g)];
-            const total = totals.length === 1 ? Number(totals[0][1].replace(/,/g, '')) : null;
+            const totals = [...(panel.innerText || '').matchAll(/([0-9][0-9,]*)\s*(?:笔|条)\s*记录/g)];
+            const total = totals.length >= 1 ? Number(totals[0][1].replace(/,/g, '')) : null;
             const populated = gridRows(grid).some(row =>
                 row.cells.length > 2 && row.cells.item(0).innerText.trim() && row.cells.item(1).innerText.trim()
             );
-            const toolbar = /导出\s*Excel/.test(panel.innerText) && /生成/.test(panel.innerText);
-            const empty = total === 0 || /暂无数据|没有数据|暂无激活码|无记录/.test(grid.innerText);
+            const hasGenerateBtn = Array.from(document.querySelectorAll('.d-button, button, a, span'))
+                .some(n => /^(?:生成|导出\s*Excel)$/.test(n.innerText.trim()));
+            const toolbar = (/导出\s*Excel/.test(panel.innerText) && /生成/.test(panel.innerText)) || hasGenerateBtn;
+            const empty = total === 0 || populated === false || /暂无数据|没有数据|暂无激活码|无记录/.test(grid.innerText);
             return {total, populated, ready: toolbar || empty, empty};
         """)
 
     def wait_for_empty_activation_list(self, ctx):
-        deadline = time.monotonic() + 12
+        deadline = time.monotonic() + 18
         stable_since = None
         while time.monotonic() < deadline:
             listing = self.activation_list(ctx)
@@ -718,7 +720,7 @@ class GiftCodeAutomator:
                     return
                 if stable_since is None:
                     stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= 1.2:
+                elif time.monotonic() - stable_since >= 0.8:
                     return
             else:
                 stable_since = None
@@ -1084,9 +1086,14 @@ class GiftCodeAutomator:
         with sync_playwright() as playwright:
             import sys
             is_headless = os.environ.get("HEADLESS", "").lower() in ("1", "true") or (sys.platform != "win32" and not os.environ.get("DISPLAY"))
-            browser = playwright.chromium.launch(headless=is_headless, slow_mo=0 if is_headless else 400, args=["--start-maximized"] if not is_headless else ["--no-sandbox", "--disable-setuid-sandbox"])
+            launch_args = ["--start-maximized"] if not is_headless else ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
+            browser = playwright.chromium.launch(headless=is_headless, slow_mo=0 if is_headless else 400, args=launch_args)
             try:
-                options = {"no_viewport": True, "locale": "zh-CN", "accept_downloads": True}
+                options = {"locale": "zh-CN", "accept_downloads": True}
+                if is_headless:
+                    options["viewport"] = {"width": 1920, "height": 1080}
+                else:
+                    options["no_viewport"] = True
                 if session.exists() and not self.job.get("credentials"):
                     try:
                         options["storage_state"] = json.loads(session.read_text(encoding="utf-8"))
