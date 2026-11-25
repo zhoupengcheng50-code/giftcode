@@ -49,6 +49,8 @@ LOCK = threading.Lock()
 STATUS = {"running": False, "mode": "", "progress": 0, "tier": "", "action": "", "logs": [], "error": None}
 PREVIEW = None
 RESULT = None
+ACTIVE_BROWSER = None
+ACTIVE_RUN_ID = None
 
 
 @app.middleware("http")
@@ -287,9 +289,16 @@ def validate_job(data):
     job["directory"] = WORK_DIR / "jobs" / job_key
     user, password = data.get("username", ""), data.get("password", "")
     if not isinstance(user, str) or not isinstance(password, str) or bool(user.strip()) != bool(password):
-        raise ValueError("首次登录时请同时填写后台账号和密码")
+        raise ValueError("请同时填写后台账号和密码")
     if user.strip():
         job["credentials"] = user.strip(), password
+    else:
+        try:
+            saved_u, saved_p = load_credentials()
+        except OSError:
+            saved_u, saved_p = "", ""
+        if not saved_u or not saved_p:
+            raise ValueError("未保存后台账密，请在「后台账号与运行选项」中填写账号和密码")
     return job
 
 
@@ -330,15 +339,23 @@ def resume_progress(job):
     return progress_dir
 
 
-def start_worker(mode, job):
-    global PREVIEW, RESULT
+def start_worker(mode, job, run_id):
+    global PREVIEW, RESULT, ACTIVE_BROWSER, ACTIVE_RUN_ID
     def log(message, level="INFO"):
         with LOCK:
-            STATUS["logs"].append({"text": message, "level": level})
+            if ACTIVE_RUN_ID == run_id:
+                STATUS["logs"].append({"text": message, "level": level})
 
     def progress(percent, tier, action):
         with LOCK:
-            STATUS.update(progress=percent, tier=tier, action=action)
+            if ACTIVE_RUN_ID == run_id:
+                STATUS.update(progress=percent, tier=tier, action=action)
+
+    def on_browser(browser):
+        global ACTIVE_BROWSER
+        with LOCK:
+            if ACTIVE_RUN_ID == run_id:
+                ACTIVE_BROWSER = browser
 
     try:
         job["directory"].mkdir(parents=True, exist_ok=True)
@@ -357,35 +374,40 @@ def start_worker(mode, job):
                 "job": job["directory"].name, "count": job["count"], "expire_time": job["expire_time"],
             }), encoding="utf-8")
             temporary.replace(execution)
-        value = GiftCodeAutomator(job, WORK_DIR, log, progress).run(mode)
-        if mode == "preview":
-            temporary = manifest.with_suffix(".tmp")
-            temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(manifest)
-            with LOCK:
-                PREVIEW = {"token": uuid4().hex, "path": job["directory"], "value": value}
-        else:
-            with LOCK:
-                RESULT = Path(value)
-        progress(100, "", "往期配置已核对" if mode == "preview" else "礼包码已全部核验并导出")
-    except Exception as exc:
-        log(str(exc), "ERROR")
+        value = GiftCodeAutomator(job, WORK_DIR, log, progress, on_browser=on_browser).run(mode)
         with LOCK:
-            STATUS.update(error=str(exc), action="已停止")
+            if ACTIVE_RUN_ID != run_id:
+                return
+            if mode == "preview":
+                temporary = manifest.with_suffix(".tmp")
+                temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(manifest)
+                PREVIEW = {"token": uuid4().hex, "path": job["directory"], "value": value}
+            else:
+                RESULT = Path(value)
+            STATUS.update(progress=100, tier="", action="往期配置已核对" if mode == "preview" else "礼包码已全部核验并导出")
+    except Exception as exc:
+        with LOCK:
+            if ACTIVE_RUN_ID == run_id:
+                STATUS["logs"].append({"text": str(exc), "level": "ERROR"})
+                STATUS.update(error=str(exc), action="已停止")
     finally:
         with LOCK:
-            STATUS["running"] = False
+            if ACTIVE_RUN_ID == run_id:
+                STATUS["running"] = False
+                ACTIVE_BROWSER = None
+                ACTIVE_RUN_ID = None
 
 
 def enqueue(mode, data):
-    global PREVIEW, RESULT
+    global PREVIEW, RESULT, ACTIVE_RUN_ID
     try:
         job = validate_job(data)
     except ValueError as exc:
         raise invalid(exc) from exc
     with LOCK:
         if STATUS["running"]:
-            raise HTTPException(409, "已有任务正在执行")
+            raise HTTPException(409, "已有任务正在执行，如需重来请先点击停止任务")
         if mode == "execute":
             if not PREVIEW or PREVIEW["token"] != data.get("preview_token") or PREVIEW["path"] != job["directory"]:
                 raise HTTPException(409, "活动参数或奖励已变化，请重新核对往期")
@@ -395,9 +417,26 @@ def enqueue(mode, data):
         else:
             PREVIEW = None
         RESULT = None
-        STATUS.update(running=True, mode=mode, progress=0, tier="", action="启动可见浏览器", logs=[], error=None)
-    threading.Thread(target=start_worker, args=(mode, job), daemon=True).start()
+        run_id = uuid4().hex
+        ACTIVE_RUN_ID = run_id
+        STATUS.update(running=True, mode=mode, progress=0, tier="", action="正在启动任务...", logs=[], error=None)
+    threading.Thread(target=start_worker, args=(mode, job, run_id), daemon=True).start()
     return {"status": "started"}
+
+
+@app.post("/api/stop")
+def stop_task():
+    global ACTIVE_BROWSER, ACTIVE_RUN_ID
+    with LOCK:
+        browser = ACTIVE_BROWSER
+        ACTIVE_BROWSER = None
+        ACTIVE_RUN_ID = None
+        if STATUS["running"]:
+            STATUS["logs"].append({"text": "任务已被手动强制断开。", "level": "WARN"})
+        STATUS.update(running=False, error="任务已手动停止", action="已手动停止")
+    if browser is not None:
+        threading.Thread(target=lambda b: b.close(), args=(browser,), daemon=True).start()
+    return {"status": "stopped"}
 
 
 @app.post("/api/preview")
@@ -744,6 +783,7 @@ WORKBENCH_HTML = r"""
           <div class="section-head">
             <div><h2>执行与导出</h2><p id="status-text" role="status">上传文档后核对往期配置</p></div>
             <div class="action-bar">
+              <button class="btn btn-danger-outline" id="stop-btn" onclick="stopTask()" hidden>停止任务</button>
               <button class="btn btn-outline" id="preview-btn" onclick="runPreview()" disabled>核对往期配置</button>
               <button class="btn btn-primary" id="start-btn" onclick="startAutomation()" disabled>生成礼包码 <span aria-hidden="true">→</span></button>
             </div>
@@ -806,6 +846,7 @@ WORKBENCH_HTML = r"""
     }
 
     function setControls() {
+      get('stop-btn').hidden = !running;
       get('preview-btn').disabled = running || !rewards;
       get('start-btn').disabled = running || !preview || !rewards || needsRewardReview();
       formIds.forEach(id => { get(id).disabled = running; });
@@ -1036,11 +1077,34 @@ WORKBENCH_HTML = r"""
         running = false;
         setControls();
         get('status-text').textContent = error.message;
+        if (/账号|密码/.test(error.message)) {
+          const acc = document.querySelector('.access-settings');
+          if (acc) acc.open = true;
+          get('username').focus();
+        } else if (/已有任务正在执行/.test(error.message)) {
+          running = true;
+          setControls();
+          poll();
+        }
       }
     }
 
     function runPreview() { return run('preview'); }
     function startAutomation() { return run('execute'); }
+
+    async function stopTask() {
+      const btn = get('stop-btn');
+      btn.disabled = true;
+      try {
+        await call('/api/stop', {});
+      } catch (_) {}
+      clearTimeout(timer);
+      running = false;
+      btn.disabled = false;
+      get('status-text').textContent = '任务已手动停止';
+      setControls();
+      poll();
+    }
 
     async function poll() {
       clearTimeout(timer);
@@ -1091,9 +1155,24 @@ WORKBENCH_HTML = r"""
     }
     setControls();
     call('/api/config').then(status => {
-      if (status.credentials_saved) get('username').placeholder = '账号已保存，可留空';
-      else document.querySelector('.access-settings').open = true;
+      if (status.credentials_saved) {
+        get('username').placeholder = '账号已保存，可留空（下次自动登录）';
+        get('password').placeholder = '密码已保存，可留空（下次自动登录）';
+      } else {
+        document.querySelector('.access-settings').open = true;
+        get('username').placeholder = '必填：请输入 GMS 后台账号';
+        get('password').placeholder = '必填：请输入 GMS 后台密码';
+      }
     }).catch(error => { get('status-text').textContent = error.message; });
+
+    call('/api/status').then(s => {
+      if (s.running) {
+        running = true;
+        setControls();
+        get('console-card').open = true;
+        poll();
+      }
+    }).catch(() => {});
 
     call('/api/auth/me').then(me => {
       const badge = get('current-user-badge');

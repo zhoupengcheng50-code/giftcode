@@ -145,11 +145,13 @@ def evaluate_gms(ctx, body, arg=None):
 
 
 class GiftCodeAutomator:
-    def __init__(self, job, work_dir, log, progress):
+    def __init__(self, job, work_dir, log, progress, on_browser=None):
         self.job = job
         self.work_dir = str(work_dir)
         self.log = log
         self.set_progress = progress
+        self.on_browser = on_browser
+        self._is_headless = False
         self.url = "https://xzvn.forceforever.com/xz-vn-gms/bdf2.core.view.frame.main.MainFrame1.d"
         self.username, self.password = job.get("credentials") or load_credentials()
         self.download_dir = job["directory"]
@@ -214,6 +216,8 @@ class GiftCodeAutomator:
         username_input = page.locator("#username_")
         if username_input.count() > 0 and username_input.is_visible():
             if not self.username or not self.password:
+                if self._is_headless:
+                    raise RuntimeError("未填写后台账号和密码，请展开「后台账号与运行选项」填写后再启动。")
                 self.log("提示: 未配置账号密码，请在弹出的浏览器中手动登录！", "WARN")
                 self.set_progress(8, "等待用户登录", "请在弹出的浏览器窗口中输入账号密码登录...")
                 page.wait_for_selector("#username_", state="hidden", timeout=300000)
@@ -1118,10 +1122,13 @@ class GiftCodeAutomator:
         with sync_playwright() as playwright:
             import sys
             is_headless = os.environ.get("HEADLESS", "").lower() in ("1", "true") or (sys.platform != "win32" and not os.environ.get("DISPLAY"))
+            self._is_headless = is_headless
             launch_args = ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
             if not is_headless:
                 launch_args.append("--start-maximized")
             browser = playwright.chromium.launch(headless=is_headless, slow_mo=0 if is_headless else 400, args=launch_args)
+            if self.on_browser:
+                self.on_browser(browser)
             try:
                 options = {
                     "locale": "zh-CN",
@@ -1151,4 +1158,9 @@ class GiftCodeAutomator:
                         self.log("当前 Windows 会话无法保存密码，将继续使用已登录的 GMS 会话。", "WARN")
                 return self.preview(ctx) if mode == "preview" else self.execute(ctx, page)
             finally:
-                browser.close()
+                if self.on_browser:
+                    self.on_browser(None)
+                try:
+                    browser.close()
+                except Exception:
+                    pass
