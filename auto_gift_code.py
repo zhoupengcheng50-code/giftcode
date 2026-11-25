@@ -520,7 +520,8 @@ class GiftCodeAutomator:
             ).filter(has=root.get_by_text("是", exact=True))
             if candidate.count() == 1:
                 candidate.get_by_text("是", exact=True).click(timeout=6000)
-                return
+                return True
+        return False
 
     def write_state(self, state):
         path = self.progress_dir / "progress.json"
@@ -529,20 +530,30 @@ class GiftCodeAutomator:
         temp.replace(path)
 
     def copy_activity(self, ctx, source, target, checkpoint, state):
+        copy_names = (source["name"] + "(copy)", source["name"] + " (copy)")
+        if "copy_candidates_before" in checkpoint:
+            old_ids = set(checkpoint["copy_candidates_before"])
+            existing_copies = [row for row in self.activity_list(ctx)
+                               if row["id"] not in old_ids and row["name"] in copy_names]
+            if not existing_copies:
+                checkpoint.pop("copy_candidates_before", None)
+
         if "copy_candidates_before" not in checkpoint:
             before = [row["id"] for row in self.activity_list(ctx)]
             self.select_activity(ctx, source["id"])
             checkpoint["copy_candidates_before"] = before
             self.write_state(state)
             click_btn_by_text(ctx, "拷贝")
-            ctx.wait_for_timeout(600)
-            self.exact_confirmation(ctx, "拷贝|复制")
+            confirm_deadline = time.monotonic() + 5
+            while time.monotonic() < confirm_deadline:
+                if self.exact_confirmation(ctx, "拷贝|复制"):
+                    break
+                ctx.wait_for_timeout(200)
 
         old_ids = set(checkpoint["copy_candidates_before"])
         for _ in range(24):
             matches = [row for row in self.activity_list(ctx)
-                       if row["id"] not in old_ids
-                       and row["name"] in (source["name"] + "(copy)", source["name"] + " (copy)")]
+                       if row["id"] not in old_ids and row["name"] in copy_names]
             if len(matches) > 1:
                 raise RuntimeError(f"发现多个候选副本，已停止处理 {target}")
             if matches:
