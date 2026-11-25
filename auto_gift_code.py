@@ -48,16 +48,23 @@ GMS_LOOKUP = r"""
             return ids.filter(id => Object.hasOwn(registry, id)).map(id => registry[id]).filter(Boolean);
         });
     }
+    function isElementVisible(el) {
+        if (!el) return false;
+        if (el.getClientRects().length > 0) return true;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        return el.offsetWidth > 0 || el.offsetHeight > 0 || (el.parentElement && isElementVisible(el.parentElement));
+    }
     function gridHeaders(grid) {
         return Array.from(grid.querySelectorAll('thead, .header-table, .header-cell, .d-grid-header'))
             .map(node => node.innerText.trim()).join(' ');
     }
     function visibleGrids() {
-        return Array.from(document.querySelectorAll('.d-grid')).filter(grid => grid.getClientRects().length);
+        return Array.from(document.querySelectorAll('.d-grid')).filter(isElementVisible);
     }
     function gridRows(grid) {
         return Array.from(grid.querySelectorAll('tr.row, tr.current-row, tr.selected-row')).filter(row =>
-            row.getClientRects().length && row.closest('.d-grid') === grid
+            isElementVisible(row) && row.closest('.d-grid') === grid
         );
     }
     function rewardGrids() {
@@ -72,18 +79,28 @@ GMS_LOOKUP = r"""
             return id && name && count && Number(id) === change.id
                 && normalize(name) === normalize(change.backend_name) && Number(count) === quantity;
         });
-        return matches.length === 1 ? matches[0] : null;
+        if (matches.length === 1) {
+            try { matches[0].scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (_) {}
+            return matches[0];
+        }
+        return null;
     }
     function rewardEditButton() {
         const grids = rewardGrids();
         if (grids.length !== 1) return null;
         for (let panel = grids[0]; panel; panel = panel.parentElement) {
-            if (panel.querySelectorAll('.d-grid').length > 1) break;
-            const buttons = Array.from(panel.querySelectorAll('button, .caption, [role="button"]'))
-                .filter(node => node.getClientRects().length && node.innerText.trim() === '编辑')
+            if (panel.querySelectorAll('.d-grid').length > 1 && panel !== grids[0]) break;
+            const buttons = Array.from(panel.querySelectorAll('button, .caption, [role="button"], .d-button'))
+                .filter(node => isElementVisible(node) && node.innerText.trim() === '编辑')
                 .map(node => node.closest('button, [role="button"], .d-toolbar-button, .d-button') || node);
             const unique = [...new Set(buttons)];
-            if (unique.length) return unique.length === 1 ? unique[0] : null;
+            if (unique.length) {
+                const btn = unique.length === 1 ? unique[0] : null;
+                if (btn) {
+                    try { btn.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (_) {}
+                }
+                return btn;
+            }
         }
         return null;
     }
@@ -738,10 +755,14 @@ class GiftCodeAutomator:
                 const label = String(text || '').normalize('NFKC').replace(/[\s:*＊]/g, '');
                 return Object.keys(roles).find(role => roles[role].test(label));
             };
-            const inputs = [...dialog.querySelectorAll('input:not([type=hidden])')]
-                .filter(input => input.getClientRects().length);
-            const calendars = [...dialog.querySelectorAll('.d-trigger-icon-date')]
-                .filter(trigger => trigger.getClientRects().length);
+            const isVisible = el => {
+                if (!el) return false;
+                if (el.getClientRects().length > 0) return true;
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+            };
+            const inputs = [...dialog.querySelectorAll('input:not([type=hidden])')].filter(isVisible);
+            const calendars = [...dialog.querySelectorAll('.d-trigger-icon-date')].filter(isVisible);
             const matches = {count: [], registration: [], expiry: []};
             for (const input of inputs) {
                 const explicit = [
@@ -1086,14 +1107,16 @@ class GiftCodeAutomator:
         with sync_playwright() as playwright:
             import sys
             is_headless = os.environ.get("HEADLESS", "").lower() in ("1", "true") or (sys.platform != "win32" and not os.environ.get("DISPLAY"))
-            launch_args = ["--start-maximized"] if not is_headless else ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
+            launch_args = ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
+            if not is_headless:
+                launch_args.append("--start-maximized")
             browser = playwright.chromium.launch(headless=is_headless, slow_mo=0 if is_headless else 400, args=launch_args)
             try:
-                options = {"locale": "zh-CN", "accept_downloads": True}
-                if is_headless:
-                    options["viewport"] = {"width": 1920, "height": 1080}
-                else:
-                    options["no_viewport"] = True
+                options = {
+                    "locale": "zh-CN",
+                    "accept_downloads": True,
+                    "viewport": {"width": 1920, "height": 1080},
+                }
                 if session.exists() and not self.job.get("credentials"):
                     try:
                         options["storage_state"] = json.loads(session.read_text(encoding="utf-8"))
@@ -1101,6 +1124,10 @@ class GiftCodeAutomator:
                         pass
                 context = browser.new_context(**options)
                 page = context.new_page()
+                try:
+                    page.set_viewport_size({"width": 1920, "height": 1080})
+                except Exception:
+                    pass
                 page.bring_to_front()
                 self.login(page, context)
                 ctx = self.open_gift_code_page(page)
