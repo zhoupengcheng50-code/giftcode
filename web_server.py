@@ -1425,10 +1425,7 @@ LOGIN_HTML = r"""
       mask-image: radial-gradient(ellipse at center, #000 55%, #000b 76%, transparent 95%);
     }
     .planet-mask, .planet-surface { position: absolute; inset: 0; }
-    .planet-mask {
-      -webkit-mask-image: radial-gradient(circle at 49.5% 48.3%, #000 22%, #000b 29%, transparent 34.5%);
-      mask-image: radial-gradient(circle at 49.5% 48.3%, #000 22%, #000b 29%, transparent 34.5%);
-    }
+    .planet-mask { clip-path: circle(33% at 49.5% 48.3%); }
     .planet-surface {
       background: var(--planet-art) center / 100% no-repeat; opacity: .86;
       transform-origin: 49.5% 48.3%; animation: planet-turn 38s linear infinite;
