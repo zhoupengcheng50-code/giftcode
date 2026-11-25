@@ -65,7 +65,7 @@ async def local_request(request: Request, call_next):
                 return JSONResponse({"detail": "非法请求来源"}, status_code=403)
 
     path = request.url.path
-    public_paths = ("/login", "/api/auth/login", "/api/auth/logout")
+    public_paths = ("/login", "/api/auth/login", "/api/auth/logout", "/assets/zpc-logo.png")
     if path not in public_paths:
         token = request.cookies.get("wb_session")
         user = verify_session_token(token)
@@ -78,7 +78,7 @@ async def local_request(request: Request, call_next):
             return JSONResponse({"detail": "仅最高权限管理员可管理账号"}, status_code=403)
 
     response = await call_next(request)
-    response.headers["Cache-Control"] = "no-store"
+    response.headers.setdefault("Cache-Control", "no-store")
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
@@ -426,6 +426,60 @@ def download():
     return FileResponse(result, filename=result.name, media_type="application/vnd.ms-excel")
 
 
+WORKBENCH_THEME_CSS = r"""
+    :root {
+      color-scheme: dark;
+      --bg: #081222; --top: #0a1425; --panel: #0f1d32; --well: #0a1628;
+      --line: #263b56; --text: #ecf3ff; --muted: #a6b9d3; --accent: #84ccff;
+      --blue: #2860da; --green: #77e6be; --amber: #ffce82; --red: #ff9fae;
+      --radius: 15px;
+    }
+    :root[data-view="review"] {
+      --bg: #061424; --top: #091b2e; --panel: #0c2138; --well: #091a2e;
+      --line: #23415e; --muted: #abc2db; --accent: #77e5f7; --blue: #12657d;
+      --radius: 11px;
+    }
+    body {
+      margin: 0; min-height: 100vh; color: var(--text);
+      font: 14px/1.55 "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      background: radial-gradient(ellipse at 63% 0%, #17315c 0%, transparent 45%), var(--bg);
+    }
+    [data-view="review"] body { background: radial-gradient(ellipse at 86% 0%, #12395b, transparent 48%), var(--bg); }
+    body { isolation: isolate; --flow-rgb: 100 164 253; --flow-bright: 112 220 255; }
+    [data-view="review"] body { --flow-rgb: 72 183 230; --flow-bright: 122 242 245; }
+    body::before, body::after {
+      content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    }
+    body::before {
+      background:
+        radial-gradient(ellipse 118% 92% at 3% 93%, transparent 75.8%, rgb(var(--flow-bright) / .36) 76%, transparent 76.2%),
+        repeating-radial-gradient(ellipse 118% 92% at 3% 93%, transparent 0 4.7%, rgb(var(--flow-rgb) / .23) 4.82%, transparent 4.98%),
+        radial-gradient(ellipse at 100% 28%, rgb(var(--flow-rgb) / .12), transparent 65%);
+      mask-image: radial-gradient(ellipse 75% 70% at 86% 12%, #000 12%, #000c 48%, transparent 100%);
+    }
+    body::after {
+      background:
+        radial-gradient(ellipse 112% 85% at 93% 5%, transparent 79.7%, rgb(var(--flow-bright) / .3) 79.9%, transparent 80.1%),
+        repeating-radial-gradient(ellipse 112% 85% at 93% 5%, transparent 0 5.3%, rgb(var(--flow-rgb) / .19) 5.42%, transparent 5.58%),
+        radial-gradient(ellipse at 0 85%, rgb(var(--flow-rgb) / .11), transparent 62%);
+      mask-image: radial-gradient(ellipse 73% 70% at 9% 85%, #000 13%, #000b 50%, transparent 100%);
+    }
+    .login-page::before, .login-page::after { opacity: .84; }
+    @media (max-width: 600px) {
+      body::before, body::after { opacity: .68; }
+      .login-page::before, .login-page::after { opacity: .58; }
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+    .brand strong, .brand small { display: block; }
+    .brand strong { font-size: 16px; }
+    .brand-logo {
+      width: 96px; height: 38px; flex: none; object-fit: cover; object-position: center 52%;
+      border: 1px solid var(--line); border-radius: 8px; background: #03061a;
+    }
+"""
+
+
 WORKBENCH_HTML = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -433,488 +487,285 @@ WORKBENCH_HTML = r"""
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>越南后台GMS礼包码自动配置工作台</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    :root {
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
-      --success: #16a34a;
-      --warning: #d97706;
-      --danger: #dc2626;
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
-      padding: 12px;
-      -webkit-text-size-adjust: 100%;
-    }
-    @media (min-width: 768px) {
-      body { padding: 24px; }
-    }
-    .container { max-width: 1200px; margin: 0 auto; width: 100%; }
-    header {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      margin-bottom: 20px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid var(--border);
-    }
-    @media (min-width: 640px) {
-      header {
-        flex-direction: row;
-        justify-content: space-between;
-        align-items: center;
-      }
-    }
-    .title-box h1 {
-      font-size: 19px;
-      font-weight: 700;
-      color: #38bdf8;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      word-break: break-word;
-    }
-    @media (min-width: 768px) {
-      .title-box h1 { font-size: 24px; gap: 10px; }
-    }
-    .title-box p { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
-    .badge {
-      display: inline-block;
-      padding: 5px 12px;
-      border-radius: 9999px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .badge-idle { background: #334155; color: #94a3b8; }
-    .badge-running { background: #1e3a8a; color: #60a5fa; animation: pulse 2s infinite; }
-    .badge-success { background: #14532d; color: #4ade80; }
-    .badge-error { background: #7f1d1d; color: #f87171; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-    
-    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-bottom: 20px; }
-    @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; } }
-    
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
-    }
-    @media (min-width: 768px) {
-      .card { padding: 20px; }
-    }
-    .card-title {
-      font-size: 15px;
-      font-weight: 600;
-      margin-bottom: 14px;
-      color: #e2e8f0;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    @media (min-width: 768px) {
-      .card-title { font-size: 16px; margin-bottom: 16px; }
-    }
-    
+""" + WORKBENCH_THEME_CSS + r"""    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    a { color: inherit; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(27px, 4vw, 38px); line-height: 1.2; letter-spacing: -.035em; }
+    h2 { font-size: 17px; font-weight: 650; }
+    h3 { font-size: 15px; }
+    small { font-size: 12px; color: var(--muted); }
+    .topbar { background: var(--top); border-bottom: 1px solid var(--line); }
+    .topbar-inner, .container { width: min(1400px, calc(100% - 64px)); margin-inline: auto; }
+    .topbar-inner { min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 10px; }
+    .header-actions, .view-switch, .page-nav, .section-head, .import-meta, .action-bar { display: flex; align-items: center; }
+    .header-actions { gap: 9px; flex-wrap: wrap; }
+    .view-switch { gap: 3px; padding: 3px; border: 1px solid var(--line); background: var(--well); border-radius: 9px; }
+    .view-switch button { border: 0; background: transparent; color: var(--muted); border-radius: 6px; padding: 5px 9px; white-space: nowrap; font-size: 12px; }
+    .view-switch button[aria-pressed="true"] { background: #233e6b; color: #edf5ff; font-weight: 650; }
+    [data-view="review"] .view-switch button[aria-pressed="true"] { background: #174e63; }
+    .badge { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; white-space: nowrap; color: var(--muted); font-size: 12px; }
+    .service-badge { color: var(--green); }
+    .service-badge::before { content: ""; display: inline-block; vertical-align: 1px; width: 6px; height: 6px; margin-right: 6px; background: var(--green); border-radius: 50%; }
+    .container { padding-block: 28px 48px; }
+    .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 14px; margin-bottom: 23px; }
+    .page-title { display: flex; align-items: center; gap: 14px; }
+    .page-title .brand-logo { width: clamp(76px, 10vw, 124px); height: auto; aspect-ratio: 5 / 2; }
+    .page-heading p, .section-head p { color: var(--muted); margin-top: 4px; }
+    .page-nav { gap: 15px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+    .page-nav a { text-decoration: none; }
+    .page-nav a:hover { color: var(--accent); text-decoration: underline; }
+    .workbench, .prep, .workspace { display: grid; gap: 16px; min-width: 0; align-content: start; }
+    .prep { grid-template-columns: minmax(0, 1fr) minmax(0, 1.65fr); }
+    [data-view="review"] .workbench { grid-template-columns: minmax(265px, .34fr) minmax(0, 1fr); align-items: start; }
+    [data-view="review"] .prep { grid-template-columns: minmax(0, 1fr); }
+    .card { min-width: 0; padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+    .section-head { justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    .section-head p { font-size: 12px; }
     .dropzone {
-      border: 2px dashed #475569;
-      border-radius: 8px;
-      padding: 20px 12px;
-      text-align: center;
-      cursor: pointer;
-      background: #0f172a;
-      transition: all 0.2s;
+      display: grid; justify-items: center; align-content: center; gap: 4px; min-height: 124px; width: 100%; padding: 12px;
+      border: 1px dashed #4a76a5; border-radius: 10px; color: var(--text);
+      background: radial-gradient(ellipse at top, #162e50, transparent 80%), var(--well);
     }
-    @media (min-width: 768px) {
-      .dropzone { padding: 26px; }
+    [data-view="review"] .dropzone { background: radial-gradient(ellipse at top, #133c54, transparent 80%), var(--well); }
+    .dropzone:hover, .dropzone.is-dragging { border-color: var(--accent); }
+    .upload-icon, .empty-icon { display: grid; place-items: center; width: 34px; height: 34px; margin-bottom: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--well); color: var(--accent); font-size: 21px; }
+    .file-types { color: var(--muted); font-size: 11px; letter-spacing: .055em; }
+    .import-meta { justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; margin-top: 9px; color: var(--muted); font-size: 12px; }
+    #upload-status[data-state="error"] { color: var(--red); }
+    #upload-status[data-state="ready"] { color: var(--green); }
+    .paste-toggle { background: none; border: 0; color: var(--accent); padding: 4px 0; text-align: left; }
+    .paste-toggle:hover { text-decoration: underline; }
+    .paste-area { margin-top: 10px; }
+    .paste-area textarea { min-height: 95px; resize: vertical; display: block; margin-bottom: 8px; }
+    .settings-grid, .form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+    .settings-grid { grid-template-columns: minmax(0, 2fr) minmax(0, .9fr) minmax(0, 1.4fr) minmax(0, .75fr); }
+    [data-view="review"] .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    [data-view="review"] :is(.activity-field, .expire-field) { grid-column: 1 / -1; }
+    [data-view="review"] .expire-field { grid-row: 3; }
+    .form-group { min-width: 0; }
+    label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+    input:not([type="checkbox"], [type="file"]), textarea { width: 100%; min-height: 36px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; background: var(--well); color: var(--text); }
+    input::placeholder, textarea::placeholder { color: #839bb8; opacity: 1; }
+    input[type="number"], #batch-date, #expire-time { font-variant-numeric: tabular-nums; }
+    .access-settings { margin-top: 9px; border-top: 1px solid var(--line); }
+    summary { cursor: pointer; color: var(--muted); padding: 8px 0; font-size: 13px; }
+    .access-settings summary { color: var(--accent); }
+    .switch-label { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+    .empty-state { display: grid; justify-items: center; gap: 5px; padding: 26px 10px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 10px; background: var(--well); }
+    .empty-state strong { color: var(--text); }
+    .empty-state p { font-size: 12px; }
+    .review-totals { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip { display: inline-block; width: max-content; max-width: 100%; padding: 1px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+    .chip[data-status="same"] { color: var(--green); border-color: #26584f; background: #102d30; }
+    .chip[data-status="quantity"] { color: var(--amber); border-color: #665035; background: #30271f; }
+    .chip[data-status="review"] { color: var(--red); border-color: #704452; background: #362431; }
+    .tiers-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .tier-card { min-width: 0; padding: 11px; border-radius: 9px; background: var(--well); border: 1px solid var(--line); }
+    .tier-card-head, .tier-choice { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+    .tier-title { font-size: 15px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .tier-target { overflow-wrap: anywhere; color: var(--muted); font-size: 12px; margin: 3px 0 1px; }
+    .tier-source { display: block; color: var(--muted); font-size: 11px; }
+    .card-rewards { margin-top: 7px; }
+    .reward-item { border-top: 1px solid var(--line); padding: 4px 0; font-size: 12px; }
+    .reward-main { display: flex; justify-content: space-between; gap: 5px; }
+    .reward-main span:first-child { overflow-wrap: anywhere; }
+    .reward-main span:last-child { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .reward-note { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .reward-note[data-status="quantity"] { color: var(--amber); }
+    .reward-note[data-status="review"] { color: var(--red); }
+    .review-layout { display: none; }
+    [data-view="review"] .tiers-grid { display: none; }
+    [data-view="review"] .review-layout { display: grid; grid-template-columns: 148px minmax(0, 1fr); gap: 12px; align-items: start; }
+    .tier-picker { display: grid; gap: 5px; }
+    .tier-choice { min-width: 0; min-height: 37px; text-align: left; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--well); color: var(--text); }
+    .tier-choice:hover, .tier-choice[aria-pressed="true"] { border-color: #539caf; background: #113a4d; }
+    .tier-choice strong { font-size: 13px; font-variant-numeric: tabular-nums; }
+    .tier-detail { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--well); overflow: hidden; }
+    .tier-detail-head { padding: 11px 12px; border-bottom: 1px solid var(--line); }
+    .table-scroll { overflow-x: auto; }
+    .reward-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+    .reward-table th, .reward-table td { padding: 7px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .reward-table th { background: #112942; color: var(--muted); font-weight: 550; }
+    .reward-table tbody tr:last-child td { border-bottom: 0; }
+    .reward-table th:nth-child(2), .reward-table th:nth-child(3), .reward-table td:nth-child(2), .reward-table td:nth-child(3) { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .reward-table td:first-child { overflow-wrap: anywhere; }
+    .execution-card .section-head { margin-bottom: 0; }
+    .action-bar { gap: 7px; flex-wrap: wrap; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 6px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--text); font-weight: 650; text-decoration: none; text-align: center; }
+    .btn-sm { min-height: 30px; padding: 4px 8px; font-size: 12px; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary { background: var(--blue); border-color: #6794ef; }
+    [data-view="review"] .btn-primary { border-color: #55b7cb; }
+    .btn-outline, .btn-danger-outline { background: var(--well); border-color: var(--line); }
+    .btn-danger-outline { color: var(--muted); }
+    .btn-success { background: #16403d; border-color: #367261; color: #aeffdf; }
+    .btn:hover:not(:disabled) { filter: brightness(1.2); }
+    .progress-box, .download-card { display: none; margin-top: 12px; }
+    .progress-text { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+    .progress-track { height: 6px; background: var(--well); border-radius: 6px; overflow: hidden; }
+    .progress-fill { width: 0; height: 100%; background: linear-gradient(90deg, #4180f4, var(--accent)); }
+    .download-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px; border: 1px solid #30665c; border-radius: 8px; background: #102d30; }
+    .download-card h3 { color: var(--green); }
+    .download-card p { color: var(--muted); font-size: 12px; }
+    .console-card { border-top: 1px solid var(--line); margin-top: 12px; }
+    .terminal { border: 1px solid var(--line); border-radius: 8px; background: var(--well); padding: 9px; height: 170px; overflow: auto; overflow-wrap: anywhere; font: 12px/1.55 Consolas, "Microsoft YaHei UI", monospace; }
+    .log-INFO { color: #b1cff7; }
+    .log-SUCCESS { color: var(--green); }
+    .log-WARN { color: var(--amber); }
+    .log-ERROR { color: var(--red); }
+    .modal-overlay { position: fixed; inset: 0; z-index: 10; display: none; align-items: center; justify-content: center; background: #030915b8; padding: 16px; }
+    .modal-card { width: min(100%, 480px); max-height: 90vh; overflow: auto; padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+    .user-list { display: grid; gap: 6px; max-height: 240px; overflow: auto; margin-top: 9px; }
+    .user-item { display: flex; align-items: center; justify-content: space-between; padding: 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--well); }
+    @media (max-width: 1120px) {
+      .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .tiers-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
-    .dropzone:hover { border-color: #38bdf8; background: #1e293b; }
-    .dropzone-icon { font-size: 28px; margin-bottom: 6px; }
-    @media (min-width: 768px) { .dropzone-icon { font-size: 32px; } }
-    
-    .paste-toggle {
-      margin-top: 10px;
-      font-size: 13px;
-      color: #38bdf8;
-      cursor: pointer;
-      text-align: center;
-      text-decoration: underline;
-      padding: 4px;
+    @media (max-width: 880px) {
+      [data-view="review"] .workbench { grid-template-columns: minmax(0, 1fr); }
+      [data-view="review"] .prep { grid-template-columns: minmax(0, 1fr) minmax(0, 1.65fr); }
+      .topbar-inner, .container { width: calc(100% - 32px); }
+      .page-heading { align-items: start; flex-direction: column; }
     }
-    .paste-area {
-      display: none;
-      margin-top: 12px;
+    @media (max-width: 620px) {
+      .topbar-inner { align-items: start; flex-direction: column; }
+      .prep, [data-view="review"] .prep { grid-template-columns: minmax(0, 1fr); }
+      .container { padding-top: 20px; }
+      .card { padding: 12px; }
+      .action-bar .btn { flex: 1; }
+      .action-bar { width: 100%; }
+      [data-view="review"] .review-layout { grid-template-columns: minmax(0, 1fr); }
+      .tier-picker { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .tier-choice { display: grid; justify-items: start; }
     }
-    textarea {
-      width: 100%;
-      height: 110px;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 12px;
-      color: var(--text);
-      font-size: 15px;
-      font-family: monospace;
-      outline: none;
-    }
-    
-    .form-row { display: grid; grid-template-columns: 1fr; gap: 10px; margin-bottom: 10px; }
-    @media (min-width: 600px) {
-      .form-row { grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-    }
-    .form-group { margin-bottom: 8px; }
-    @media (min-width: 600px) { .form-group { margin-bottom: 12px; } }
-    label { display: block; font-size: 13px; font-weight: 500; color: var(--text-muted); margin-bottom: 6px; }
-    input[type="text"], input[type="password"], input[type="number"] {
-      width: 100%;
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 12px;
-      color: var(--text);
-      font-size: 14px;
-      outline: none;
-    }
-    input:focus, textarea:focus { border-color: #38bdf8; }
-    .switch-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
-    
-    .tiers-container { margin-top: 24px; }
-    .tiers-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-      gap: 16px;
-    }
-    .tier-card {
-      background: #0f172a;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
-    }
-    .tier-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 10px;
-    }
-    .tier-name { font-weight: 700; font-size: 15px; color: #38bdf8; }
-    .item-chip {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      background: #1e293b;
-      padding: 4px 8px;
-      border-radius: 4px;
-      font-size: 12px;
-      margin-bottom: 6px;
-      border: 1px solid #334155;
-      transition: all 0.2s;
-    }
-    .item-qty { font-weight: 700; color: #fbbf24; }
-
-    /* 和上传配置一致的绿色标注样式 */
-    .item-chip-matched {
-      background: rgba(16, 185, 129, 0.1) !important;
-      border: 1px solid rgba(16, 185, 129, 0.5) !important;
-    }
-    .tag-match-ok {
-      color: #34d399 !important;
-      font-size: 11px;
-      font-weight: 600;
-      margin-left: 6px;
-    }
-    .tier-badge-ok {
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 4px;
-      background: rgba(16, 185, 129, 0.2);
-      color: #34d399;
-      border: 1px solid #10b981;
-      font-weight: 600;
-    }
-
-    /* 和上传配置不一致的红色警示样式 */
-    .item-chip-mismatch {
-      background: rgba(239, 68, 68, 0.22) !important;
-      border: 1px solid #ef4444 !important;
-      box-shadow: 0 0 10px rgba(239, 68, 68, 0.35) !important;
-    }
-    .item-chip-mismatch .item-name {
-      color: #fca5a5 !important;
-      font-weight: 700 !important;
-    }
-    .tag-match-err {
-      color: #f87171 !important;
-      font-size: 11px;
-      font-weight: 700;
-      margin-left: 6px;
-    }
-    .tier-badge-err {
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 4px;
-      background: rgba(239, 68, 68, 0.3);
-      color: #f87171;
-      border: 1px solid #ef4444;
-      font-weight: 700;
-    }
-
-    /* 尚未执行核验时的上传配置默认样式 */
-    .tier-badge-pending {
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 4px;
-      background: rgba(56, 189, 248, 0.15);
-      color: #38bdf8;
-      border: 1px solid #0284c7;
-      font-weight: 600;
-    }
-    .tag-pending {
-      color: #94a3b8;
-      font-size: 11px;
-      margin-left: 4px;
-    }
-    
-    .action-bar {
-      margin: 20px 0;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    @media (min-width: 640px) {
-      .action-bar {
-        flex-direction: row;
-        align-items: center;
-        flex-wrap: wrap;
-      }
-    }
-    .btn {
-      padding: 12px 20px;
-      border-radius: 8px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      border: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      min-height: 44px;
-      transition: all 0.2s;
-      width: 100%;
-    }
-    @media (min-width: 640px) {
-      .btn { width: auto; }
-    }
-    .btn-primary { background: var(--primary); color: white; }
-    .btn-primary:hover:not(:disabled) {
-      background: var(--primary-hover);
-      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
-    }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-success { background: var(--success); color: white; text-decoration: none; }
-    .btn-success:hover { background: #15803d; box-shadow: 0 4px 12px rgba(22, 163, 74, 0.4); }
-    
-    .progress-box { margin: 16px 0; display: none; }
-    .progress-track {
-      background: #0f172a;
-      height: 10px;
-      border-radius: 5px;
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }
-    .progress-fill {
-      background: linear-gradient(90deg, #38bdf8, #2563eb);
-      height: 100%;
-      width: 0%;
-      transition: width 0.3s;
-    }
-    .progress-text {
-      display: flex;
-      justify-content: space-between;
-      font-size: 13px;
-      margin-top: 6px;
-      color: var(--text-muted);
-    }
-    
-    .console-card { margin-top: 24px; }
-    .terminal {
-      background: #000;
-      border-radius: 8px;
-      padding: 16px;
-      font-family: Consolas, Monaco, "Courier New", monospace;
-      font-size: 13px;
-      height: 260px;
-      overflow-y: auto;
-      border: 1px solid #1e293b;
-    }
-    .log-line { margin-bottom: 4px; line-height: 1.4; }
-    .log-time { color: #64748b; }
-    .log-INFO { color: #93c5fd; }
-    .log-SUCCESS { color: #4ade80; font-weight: bold; }
-    .log-WARN { color: #fde047; }
-    .log-ERROR { color: #f87171; font-weight: bold; }
-    
-    .download-card {
-      background: linear-gradient(135deg, #064e3b 0%, #0f172a 100%);
-      border: 1px solid #059669;
-      border-radius: 12px;
-      padding: 20px;
-      margin-top: 24px;
-      display: none;
-    }
-    .download-card h3 { color: #34d399; font-size: 18px; margin-bottom: 8px; }
-    .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 6px; min-height: 32px; width: auto; }
-    .btn-outline { background: #1e293b; border: 1px solid #475569; color: #38bdf8; }
-    .btn-outline:hover { background: #334155; border-color: #38bdf8; }
-    .btn-danger-outline { background: rgba(220,38,38,0.12); border: 1px solid #ef4444; color: #fca5a5; }
-    .btn-danger-outline:hover { background: rgba(220,38,38,0.25); }
-    .modal-overlay {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.72); backdrop-filter: blur(4px);
-      display: none; align-items: center; justify-content: center; z-index: 999; padding: 16px;
-    }
-    .modal-card {
-      background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px;
-      max-width: 480px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
-    }
-    .user-list { margin-top: 14px; max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-    .user-item {
-      display: flex; justify-content: space-between; align-items: center; padding: 8px 12px;
-      background: #0f172a; border: 1px solid #334155; border-radius: 6px; font-size: 13px;
+    @media (max-width: 390px) {
+      .tiers-grid { grid-template-columns: minmax(0, 1fr); }
+      .tier-picker { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <div class="title-box">
-        <h1>🎮 越南后台GMS礼包码自动配置工作台</h1>
-        <p>支持文档直接解析（.docx/.xlsx/.txt/直接粘贴）、多档位自动配置与合并 .xls 表格直出</p>
-      </div>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><div><strong>GMS 工作台</strong><small>越南 · 礼包码配置</small></div></div>
       <div class="header-actions">
-        <span id="current-user-badge" class="badge badge-idle">校验中...</span>
-        <button id="manage-users-btn" class="btn btn-sm btn-outline" style="display:none;" onclick="openUsersModal()">👥 账号管理</button>
-        <button class="btn btn-sm btn-danger-outline" onclick="logout()">🚪 退出</button>
-        <span id="global-badge" class="badge badge-idle">服务在线</span>
-      </div>
-    </header>
-
-    <div class="grid">
-      <div class="card">
-        <div class="card-title">📄 1. 上传配置文档 (.docx / .xlsx / .txt)</div>
-        <div class="dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
-          <div class="dropzone-icon">📁</div>
-          <div style="font-weight: 600; font-size: 15px;">点击或拖拽上传奖励文档 (.docx / .xlsx / .txt)</div>
-          <div style="color: #64748b; font-size: 12px; margin-top: 4px;">无需配图，仅需【挡位】与【奖励】两列即可识别 8 大档位</div>
-          <input type="file" id="file-input" accept=".docx,.xlsx,.xls,.txt,.csv" style="display: none;" onchange="handleFileSelect(event)">
+        <div class="view-switch" role="group" aria-label="工作台布局">
+          <button type="button" data-view="flow" aria-pressed="true">流程总览</button>
+          <button type="button" data-view="review" aria-pressed="false">档位核对</button>
         </div>
-        <div class="paste-toggle" onclick="togglePasteArea()">或点击此处直接粘贴表格文本 📝</div>
-        
-        <div class="paste-area" id="paste-area">
-          <textarea id="paste-text" placeholder="直接粘贴微信/Excel里的文字表格，如：\n| 挡位 | 奖励 |\n| 100.000 | 仙玉 x300 上清精元丹 x3... |"></textarea>
-          <button class="btn btn-primary" style="margin-top: 8px; padding: 6px 14px; font-size: 13px;" onclick="handleTextParse()">解析粘贴内容</button>
-        </div>
-        
-        <div id="upload-status" style="margin-top: 10px; font-size: 13px; color: #38bdf8; display: none;"></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">⚙️ 2. 活动批次与生成参数</div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>本次活动命名</label>
-            <input type="text" id="activity-name" placeholder="越南2026网页支付累充礼包码20261125">
-          </div>
-          <div class="form-group">
-            <label for="batch-date">本期批次日期</label>
-            <input type="text" id="batch-date" inputmode="numeric" maxlength="8" placeholder="YYYYMMDD，名称已有日期可留空">
-          </div>
-          <div class="form-group">
-            <label>礼包码失效时间（GMS 时间）</label>
-            <input type="text" id="expire-time" placeholder="YYYY-MM-DD HH:MM:SS">
-          </div>
-          <div class="form-group">
-            <label>单档生成数量</label>
-            <input type="number" id="code-count" min="1" max="65535" value="100">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>后台账号</label>
-            <input type="text" id="username" placeholder="已保存时可留空">
-          </div>
-          <div class="form-group">
-            <label>后台密码</label>
-            <input type="password" id="password" placeholder="已保存时可留空" autocomplete="off">
-          </div>
-        </div>
-        <div style="margin-top: 6px;">
-          <label class="switch-label">
-            <input type="checkbox" id="show-browser" checked disabled>
-            <span>执行时显示浏览器窗口</span>
-          </label>
-        </div>
+        <span id="global-badge" class="badge service-badge">服务在线</span>
+        <span id="current-user-badge" class="badge badge-idle">校验中…</span>
+        <button id="manage-users-btn" class="btn btn-sm btn-outline" style="display:none" onclick="openUsersModal()">账号管理</button>
+        <button class="btn btn-sm btn-danger-outline" onclick="logout()">退出</button>
       </div>
     </div>
-
-    <div class="card tiers-container">
-      <div class="card-title" style="justify-content: space-between;">
-        <span>🎁 3. 各档位奖励配置预览 (8大档位)</span>
-        <span style="font-size: 12px; color: var(--text-muted);" id="tier-stat-badge">请上传活动文档</span>
+  </header>
+  <main class="container">
+    <div class="page-heading">
+      <div class="page-title">
+        <img class="brand-logo" src="/assets/zpc-logo.png" alt="ZPC" width="96" height="38">
+        <div><h1>礼包码自动配置</h1><p>导入奖励文档、核对往期档位，生成并导出礼包码。</p></div>
       </div>
-      <div class="tiers-grid" id="tiers-grid"></div>
+      <nav class="page-nav" aria-label="页面区块"><a href="#configuration">导入与参数</a><a href="#rewards">奖励预览</a><a href="#execution">执行与导出</a></nav>
     </div>
 
-    <div class="action-bar">
-      <button class="btn btn-primary" id="preview-btn" onclick="runPreview()">核对往期配置</button>
-      <button class="btn btn-primary" id="start-btn" onclick="startAutomation()" disabled>
-        <span>🚀 一键生成礼包码配置</span>
-      </button>
-      <div id="status-text" style="font-size: 14px; color: #94a3b8;">上传文档后核对往期配置</div>
-    </div>
+    <div class="workbench">
+      <section class="prep" id="configuration" aria-label="导入与参数">
+        <section class="card import-card">
+          <div class="section-head"><h2>导入奖励文档</h2></div>
+          <button type="button" class="dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
+            <span class="upload-icon" aria-hidden="true">↑</span>
+            <strong>选择文件或拖放到此处</strong>
+            <span class="file-types">DOCX · XLSX · XLS · TXT · CSV</span>
+          </button>
+          <input type="file" id="file-input" accept=".docx,.xlsx,.xls,.txt,.csv" hidden onchange="handleFileSelect(event)">
+          <div class="import-meta">
+            <button class="paste-toggle" type="button" aria-controls="paste-area" aria-expanded="false" onclick="togglePasteArea()">粘贴表格文本</button>
+            <span id="upload-status" role="status">支持「档位」「奖励」两列</span>
+          </div>
+          <div class="paste-area" id="paste-area" hidden>
+            <label for="paste-text">表格文本</label>
+            <textarea id="paste-text" placeholder="粘贴来自微信或 Excel 的档位和奖励两列"></textarea>
+            <button id="parse-btn" class="btn btn-outline btn-sm" onclick="handleTextParse()">解析粘贴内容</button>
+          </div>
+        </section>
 
-    <div class="progress-box" id="progress-box">
-      <div class="progress-track">
-        <div class="progress-fill" id="progress-fill"></div>
-      </div>
-      <div class="progress-text">
-        <span id="current-action-text">正在初始化...</span>
-        <span id="progress-percent-text">0%</span>
-      </div>
-    </div>
+        <section class="card settings-card">
+          <div class="section-head"><h2>活动批次与生成参数</h2></div>
+          <div class="settings-grid">
+            <div class="form-group activity-field">
+              <label for="activity-name">本次活动命名</label>
+              <input type="text" id="activity-name" placeholder="越南2026网页支付累充礼包码20261125">
+            </div>
+            <div class="form-group">
+              <label for="batch-date">本期批次日期</label>
+              <input type="text" id="batch-date" inputmode="numeric" maxlength="8" placeholder="YYYYMMDD" title="活动名称已有日期时可留空">
+            </div>
+            <div class="form-group expire-field">
+              <label for="expire-time">失效时间（GMS 时间）</label>
+              <input type="text" id="expire-time" placeholder="YYYY-MM-DD HH:MM:SS">
+            </div>
+            <div class="form-group">
+              <label for="code-count">单档生成数量</label>
+              <input type="number" id="code-count" min="1" max="65535" value="100">
+            </div>
+          </div>
+          <details class="access-settings">
+            <summary>后台账号与运行选项</summary>
+            <div class="form-row">
+              <div class="form-group"><label for="username">后台账号</label><input type="text" id="username" placeholder="已保存时可留空"></div>
+              <div class="form-group"><label for="password">后台密码</label><input type="password" id="password" placeholder="已保存时可留空" autocomplete="off"></div>
+            </div>
+            <label class="switch-label"><input type="checkbox" id="show-browser" checked disabled>执行时显示浏览器窗口</label>
+          </details>
+        </section>
+      </section>
 
-    <div class="download-card" id="download-card">
-      <h3>🎉 礼包码全部生成并整合完毕！</h3>
-      <p style="font-size: 14px; color: #a7f3d0; margin-bottom: 14px;">
-        所有 8 个档位（100~10000）的激活码已成功合并为包含 8 个独立页签的Excel 97–2003 (.xls) 表格。
-      </p>
-      <div style="display: flex; gap: 12px;">
-        <a href="/api/download/xls" class="btn btn-success" download style="text-decoration:none; font-size:16px; padding:12px 28px;">
-          <span>📥 下载整合激活码表格 (.xls)</span>
-        </a>
-      </div>
-    </div>
+      <div class="workspace">
+        <section class="card tiers-container" id="rewards">
+          <div class="section-head review-head">
+            <div><h2>奖励配置预览</h2><p id="tier-stat-badge">导入文档后显示档位与奖励</p></div>
+            <div class="review-totals" id="review-totals" hidden></div>
+          </div>
+          <div class="empty-state" id="empty-state"><span class="empty-icon" aria-hidden="true">▦</span><strong>等待导入奖励配置</strong><p>上传文档或粘贴表格文本后，即可查看各档奖励。</p></div>
+          <div class="tiers-grid" id="tiers-grid" hidden></div>
+          <div class="review-layout" id="review-layout" hidden>
+            <div class="tier-picker" id="tier-picker" role="group" aria-label="选择累充档位"></div>
+            <div class="tier-detail" id="tier-detail"></div>
+          </div>
+        </section>
 
-    <div class="card console-card">
-      <div class="card-title">🖥️ 实时操作执行日志</div>
-      <div class="terminal" id="terminal">
-        <div class="log-line"><span class="log-time">[00:00:00]</span> <span class="log-INFO">工作台启动就绪，等待执行指令...</span></div>
+        <section class="card execution-card" id="execution">
+          <div class="section-head">
+            <div><h2>执行与导出</h2><p id="status-text" role="status">上传文档后核对往期配置</p></div>
+            <div class="action-bar">
+              <button class="btn btn-outline" id="preview-btn" onclick="runPreview()" disabled>核对往期配置</button>
+              <button class="btn btn-primary" id="start-btn" onclick="startAutomation()" disabled>生成礼包码 <span aria-hidden="true">→</span></button>
+            </div>
+          </div>
+          <div class="progress-box" id="progress-box">
+            <div class="progress-text"><span id="current-action-text">正在初始化…</span><span id="progress-percent-text">0%</span></div>
+            <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+          </div>
+          <div class="download-card" id="download-card">
+            <div class="download-inner"><div><h3>礼包码生成完成</h3><p>已合并为 8 个独立档位页签的 Excel 文件。</p></div>
+            <a href="/api/download/xls" class="btn btn-success" download>下载激活码表格 (.xls)</a></div>
+          </div>
+          <details class="console-card" id="console-card">
+            <summary>实时执行日志</summary>
+            <div class="terminal" id="terminal" tabindex="0" aria-label="执行日志">
+              <div class="log-INFO">工作台已就绪，等待执行指令。</div>
+            </div>
+          </details>
+        </section>
       </div>
     </div>
-  </div>
+  </main>
 
   <script>
     let rewards = null;
@@ -927,7 +778,9 @@ WORKBENCH_HTML = r"""
 
     function togglePasteArea() {
       const area = get('paste-area');
-      area.style.display = area.style.display === 'block' ? 'none' : 'block';
+      area.hidden = !area.hidden;
+      document.querySelector('.paste-toggle').setAttribute('aria-expanded', !area.hidden);
+      if (!area.hidden) get('paste-text').focus();
     }
 
     function element(tag, text, className) {
@@ -956,44 +809,158 @@ WORKBENCH_HTML = r"""
       get('preview-btn').disabled = running || !rewards;
       get('start-btn').disabled = running || !preview || !rewards || needsRewardReview();
       formIds.forEach(id => { get(id).disabled = running; });
-      const upload = document.querySelector('input[type=file]');
-      upload.disabled = running;
+      get('file-input').disabled = running;
+      get('dropzone').disabled = running;
+      get('parse-btn').disabled = running;
       get('paste-text').disabled = running;
+    }
+
+    const rewardLabels = {same: '一致', kept: '后台保留', review: '待核对', quantity: '数量调整'};
+    const viewButtons = document.querySelectorAll('.view-switch button');
+    let selectedTier;
+
+    function setView(view) {
+      document.documentElement.dataset.view = view;
+      viewButtons.forEach(button => button.setAttribute('aria-pressed', button.dataset.view === view));
+    }
+
+    setView(localStorage.getItem('gms-workbench-view') === 'review' ? 'review' : 'flow');
+    viewButtons.forEach(button => button.addEventListener('click', () => {
+      setView(button.dataset.view);
+      localStorage.setItem('gms-workbench-view', button.dataset.view);
+    }));
+
+    function rewardChip(label, status) {
+      const chip = element('span', label, 'chip');
+      if (status) chip.dataset.status = status;
+      return chip;
+    }
+
+    function tierSummary(rows) {
+      const pending = rows.filter(row => row.status === 'review').length;
+      const changes = rows.filter(row => row.status === 'quantity').length;
+      if (pending) return rewardChip(pending + ' 项待核对', 'review');
+      if (changes) return rewardChip(changes + ' 项调整', 'quantity');
+      if (!rows.every(row => row.status === 'same')) return rewardChip('已核对');
+      return rewardChip('全部一致', 'same');
+    }
+
+    function tierHeading(tier, data, compact) {
+      const heading = element('div', '', compact ? 'tier-card-head' : 'tier-detail-head');
+      heading.append(element('h3', '累充 ' + tier, 'tier-title'));
+      if (!compact && data) {
+        heading.append(element('p', data.target, 'tier-target'),
+          element('small', '往期活动 ID ' + data.source.id, 'tier-source'));
+      }
+      return heading;
+    }
+
+    function tierCard({tier, data, rows}) {
+      const card = element('article', '', 'tier-card');
+      const head = tierHeading(tier, data, true);
+      if (data) head.append(tierSummary(rows));
+      card.append(head);
+      if (data) card.append(element('p', data.target, 'tier-target'),
+        element('small', '往期活动 ID ' + data.source.id, 'tier-source'));
+      const list = element('div', '', 'card-rewards');
+      for (const row of rows) {
+        const line = element('div', '', 'reward-item');
+        const main = element('div', '', 'reward-main');
+        main.append(element('span', row.name), element('span', '×' + (row.expected ?? row.actual)));
+        line.append(main);
+        if (row.status && row.status !== 'same') {
+          let note = rewardLabels[row.status];
+          if (row.status === 'quantity') note = '往期 ×' + row.actual + ' → 本期 ×' + row.expected;
+          if (row.status === 'review') note += '：' + row.reason;
+          const label = element('small', note, 'reward-note');
+          label.dataset.status = row.status;
+          line.append(label);
+        }
+        list.append(line);
+      }
+      card.append(list);
+      return card;
+    }
+
+    function selectTier({tier, data, rows}) {
+      selectedTier = tier;
+      const detail = get('tier-detail');
+      detail.replaceChildren(tierHeading(tier, data, false));
+      get('tier-picker').querySelectorAll('button').forEach(button => {
+        button.setAttribute('aria-pressed', button.dataset.tier === tier);
+      });
+      const table = element('table', '', 'reward-table');
+      table.setAttribute('aria-label', '累充 ' + tier + ' 奖励明细');
+      const header = table.createTHead().insertRow();
+      for (const label of ['奖励', '上一期', '本期', '核对结果']) {
+        const cell = element('th', label);
+        cell.scope = 'col';
+        header.append(cell);
+      }
+      const tbody = table.createTBody();
+      const quantity = value => value == null ? '—' : '×' + value;
+      for (const row of rows) {
+        const tr = tbody.insertRow();
+        tr.insertCell().textContent = row.name;
+        tr.insertCell().textContent = quantity(row.actual);
+        tr.insertCell().textContent = quantity(row.status === 'kept' ? row.actual : row.expected);
+        const status = tr.insertCell();
+        status.append(rewardChip(rewardLabels[row.status] ?? '未核对', row.status));
+        if (row.reason) status.append(element('small', row.reason, 'reward-note'));
+      }
+      const scroller = element('div', '', 'table-scroll');
+      scroller.append(table);
+      detail.append(scroller);
     }
 
     function render() {
       const grid = get('tiers-grid');
+      const picker = get('tier-picker');
+      const totals = get('review-totals');
       grid.replaceChildren();
+      picker.replaceChildren();
+      totals.replaceChildren();
+      grid.hidden = get('review-layout').hidden = !rewards;
+      get('empty-state').hidden = Boolean(rewards);
+      totals.hidden = !preview || !rewards;
       if (!rewards) {
-        get('tier-stat-badge').textContent = '请上传活动文档';
+        selectedTier = undefined;
+        get('tier-detail').replaceChildren();
+        get('tier-stat-badge').textContent = '导入文档后显示档位与奖励';
         return;
       }
-      const batch = preview ? '本期 ' + preview.batch_date + ' · 上一期 ' + preview.baseline : '已识别 8 档，等待核对往期';
-      get('tier-stat-badge').textContent = batch + (needsRewardReview() ? ' · 有奖励待核对' : '');
-      Object.entries(rewards).forEach(([tier, items]) => {
-        const card = element('div', '', 'tier-card');
+      const tiers = Object.entries(rewards).map(([tier, items]) => {
         const data = preview?.tiers[tier];
-        card.append(element('div', '累充 ' + tier, 'tier-title'));
-        if (data) {
-          card.append(element('div', data.target));
-          card.append(element('small', '往期活动 ID ' + data.source.id));
-        }
         const rows = data?.items ?? Object.entries(items).map(([name, expected]) => ({name, expected}));
-        for (const row of rows) {
-          let message = row.name + ' ×' + (row.expected ?? row.actual);
-          if (data) {
-            if (row.status === 'same') message += ' · 一致';
-            else if (row.status === 'kept') message += ' · 后台已有，保留';
-            else if (row.status === 'review') message += ' · 待核对：' + row.reason;
-            else if (row.status === 'quantity') message += ' · 往期 ×' + row.actual + ' → 本次 ×' + row.expected;
-          }
-          const line = element('div', message, 'reward-item');
-          if (data) line.style.color = row.status === 'kept' ? '#94a3b8' : row.matched ? '#6ee7b7' : '#fca5a5';
-          card.append(line);
-        }
-        grid.append(card);
+        return {tier, data, rows};
       });
+      const batch = preview ? '本期 ' + preview.batch_date + ' · 上一期 ' + preview.baseline : '已识别 ' + tiers.length + ' 档，等待核对往期';
+      get('tier-stat-badge').textContent = batch;
+      if (preview) {
+        const rows = tiers.flatMap(tier => tier.rows);
+        for (const [status, label] of Object.entries(rewardLabels)) {
+          const count = rows.filter(row => row.status === status).length;
+          if (count) totals.append(rewardChip(label + ' ' + count, status));
+        }
+      }
+      for (const tier of tiers) {
+        grid.append(tierCard(tier));
+        const button = element('button', '', 'tier-choice');
+        button.type = 'button';
+        button.dataset.tier = tier.tier;
+        button.setAttribute('aria-label', '累充 ' + tier.tier);
+        button.append(element('strong', tier.tier));
+        if (tier.data) button.append(tierSummary(tier.rows));
+        button.addEventListener('click', () => selectTier(tier));
+        picker.append(button);
+      }
+      const active = tiers.find(tier => tier.tier === selectedTier)
+        ?? tiers.find(tier => tier.rows.some(row => row.status === 'review'))
+        ?? tiers.find(tier => tier.rows.some(row => row.status === 'quantity'))
+        ?? tiers[0];
+      if (active) selectTier(active);
     }
+
 
     function clearPreview() {
       preview = null;
@@ -1008,13 +975,14 @@ WORKBENCH_HTML = r"""
       rewards = null;
       clearPreview();
       const status = get('upload-status');
-      status.style.display = 'block';
+      status.dataset.state = 'loading';
       status.textContent = '读取奖励文档…';
       try {
         const parsed = await call(url, body, form);
         if (requestNumber !== uploadNumber) return;
         rewards = parsed.rewards;
-        status.textContent = '已识别 8 档奖励';
+        status.dataset.state = 'ready';
+        status.textContent = '已识别 ' + Object.keys(rewards).length + ' 档奖励';
         if (parsed.defaults) {
           get('activity-name').value = parsed.defaults.activity_name;
           get('batch-date').value = parsed.defaults.batch_date;
@@ -1023,6 +991,7 @@ WORKBENCH_HTML = r"""
         }
       } catch (error) {
         if (requestNumber !== uploadNumber) return;
+        status.dataset.state = 'error';
         status.textContent = error.message;
       }
       render();
@@ -1057,6 +1026,7 @@ WORKBENCH_HTML = r"""
       if (mode === 'preview') clearPreview();
       running = true;
       setControls();
+      get('console-card').open = true;
       get('status-text').textContent = '正在启动浏览器';
       get('download-card').style.display = 'none';
       try {
@@ -1108,20 +1078,26 @@ WORKBENCH_HTML = r"""
     formIds.forEach(id => get(id).addEventListener('input', clearPreview));
     const zone = get('dropzone');
     if (zone) {
-      zone.addEventListener('dragover', event => event.preventDefault());
+      zone.addEventListener('dragover', event => {
+        event.preventDefault();
+        if (!running) zone.classList.add('is-dragging');
+      });
+      zone.addEventListener('dragleave', () => zone.classList.remove('is-dragging'));
       zone.addEventListener('drop', event => {
         event.preventDefault();
+        zone.classList.remove('is-dragging');
         if (event.dataTransfer.files.length) handleFileSelect({target: event.dataTransfer});
       });
     }
     setControls();
     call('/api/config').then(status => {
       if (status.credentials_saved) get('username').placeholder = '账号已保存，可留空';
+      else document.querySelector('.access-settings').open = true;
     }).catch(error => { get('status-text').textContent = error.message; });
 
     call('/api/auth/me').then(me => {
       const badge = get('current-user-badge');
-      badge.textContent = (me.role === 'admin' ? '👑 管理员: ' : '👤 ') + me.username;
+      badge.textContent = (me.role === 'admin' ? '管理员 · ' : '') + me.username;
       if (me.role === 'admin') {
         badge.className = 'badge badge-success';
         get('manage-users-btn').style.display = 'inline-flex';
@@ -1196,20 +1172,20 @@ WORKBENCH_HTML = r"""
   <div class="modal-overlay" id="users-modal" onclick="if(event.target===this) closeUsersModal()">
     <div class="modal-card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-        <h3 style="color:#38bdf8;font-size:17px;">👥 授权账号权限管理</h3>
+        <h3 style="color:#38bdf8;font-size:17px;">授权账号管理</h3>
         <button class="btn btn-sm btn-outline" onclick="closeUsersModal()">关闭</button>
       </div>
       <div class="form-row">
         <div class="form-group">
-          <label>新授权账号</label>
+          <label for="new-auth-user">新授权账号</label>
           <input type="text" id="new-auth-user" placeholder="输入用户名(2~32位)">
         </div>
         <div class="form-group">
-          <label>登录密码</label>
+          <label for="new-auth-pass">登录密码</label>
           <input type="password" id="new-auth-pass" placeholder="设置密码(至少4位)">
         </div>
       </div>
-      <button class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">➕ 添加并授权该账号</button>
+      <button class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">添加授权账号</button>
       <div id="user-msg" style="font-size:13px;margin-top:8px;"></div>
       <div style="margin-top:16px;font-size:13px;color:#94a3b8;font-weight:600;">当前已授权账号列表：</div>
       <div class="user-list" id="user-list"></div>
@@ -1225,101 +1201,107 @@ LOGIN_HTML = r"""
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>安全登录 - 越南后台GMS礼包码配置工作台</title>
+  <title>登录 · GMS 工作台</title>
+  <script>
+    try {
+      if (localStorage.getItem('gms-workbench-view') === 'review') {
+        document.documentElement.dataset.view = 'review';
+      }
+    } catch {
+      // Use the default theme when browser storage is unavailable.
+    }
+  </script>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-      background: #0f172a;
-      color: #f8fafc;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 16px;
-    }
+""" + WORKBENCH_THEME_CSS + r"""    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; }
+    button, input { font: inherit; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .topbar { background: var(--top); border-bottom: 1px solid var(--line); }
+    .topbar-inner { width: min(1400px, calc(100% - 64px)); min-height: 72px; margin-inline: auto; display: flex; align-items: center; }
+    .brand small { font-size: 12px; color: var(--muted); }
+    .login-main { flex: 1; display: grid; place-items: center; padding: 32px 16px; }
     .login-card {
-      width: 100%;
-      max-width: 400px;
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 14px;
-      padding: 28px 24px;
-      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+      width: min(100%, 416px); padding: clamp(20px, 6vw, 32px);
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: var(--panel); box-shadow: 0 18px 48px #02071155;
     }
-    .login-header { text-align: center; margin-bottom: 24px; }
-    .login-header h1 { font-size: 20px; color: #38bdf8; margin-bottom: 6px; }
-    .login-header p { font-size: 13px; color: #94a3b8; }
-    .form-group { margin-bottom: 16px; }
-    label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; font-weight: 500; }
+    .login-heading { margin-bottom: 23px; text-align: center; }
+    .login-title-row { display: flex; align-items: center; justify-content: center; gap: 9px; }
+    .login-title-row .brand-logo { width: 76px; height: 32px; }
+    h1 { margin: 0; font-size: clamp(23px, 5vw, 29px); line-height: 1.25; }
+    .login-heading p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+    .login-form { display: grid; gap: 15px; }
+    label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 13px; }
     input {
-      width: 100%;
-      padding: 11px 12px;
-      background: #0f172a;
-      border: 1px solid #334155;
-      border-radius: 8px;
-      color: #f8fafc;
-      font-size: 15px;
-      outline: none;
+      display: block; width: 100%; min-height: 44px; padding: 8px 11px;
+      border: 1px solid var(--line); border-radius: 7px;
+      background: var(--well); color: var(--text); font-size: 16px;
     }
-    input:focus { border-color: #38bdf8; }
-    .btn {
-      width: 100%;
-      padding: 12px;
-      background: #2563eb;
-      color: #fff;
-      border: none;
-      border-radius: 8px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      min-height: 44px;
-      transition: background 0.2s;
+    input::placeholder { color: #839bb8; opacity: 1; }
+    input:-webkit-autofill {
+      -webkit-box-shadow: 0 0 0 100px var(--well) inset;
+      -webkit-text-fill-color: var(--text);
+      caret-color: var(--text);
     }
-    .btn:hover:not(:disabled) { background: #1d4ed8; }
-    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .login-button {
+      min-height: 44px; padding: 8px 12px; display: flex; align-items: center; justify-content: center; gap: 8px;
+      border: 1px solid #6794ef; border-radius: 7px;
+      background: var(--blue); color: var(--text); font-weight: 650; cursor: pointer;
+    }
+    [data-view="review"] .login-button { border-color: #55b7cb; }
+    .login-button:hover:not(:disabled) { filter: brightness(1.2); }
+    .login-button:disabled { cursor: wait; opacity: .7; }
     .err-msg {
-      margin-top: 14px;
-      padding: 10px 12px;
-      background: rgba(220, 38, 38, 0.15);
-      border: 1px solid #ef4444;
-      border-radius: 8px;
-      color: #fca5a5;
-      font-size: 13px;
-      display: none;
-      text-align: center;
+      margin: 0; padding: 8px 10px; border: 1px solid #704452; border-radius: 7px;
+      background: #362431; color: var(--red); font-size: 13px; overflow-wrap: anywhere;
+    }
+    @media (max-width: 880px) {
+      .topbar-inner { width: calc(100% - 32px); }
     }
   </style>
 </head>
-<body>
-  <div class="login-card">
-    <div class="login-header">
-      <h1>🔐 工作台安全校验</h1>
-      <p>仅限管理员及已授权人员登录访问</p>
+<body class="login-page">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><div><strong>GMS 工作台</strong><small>越南 · 礼包码配置</small></div></div>
     </div>
-    <form id="login-form" onsubmit="handleLogin(event)">
-      <div class="form-group">
-        <label for="u">账号</label>
-        <input id="u" type="text" autocomplete="username" required placeholder="请输入授权账号">
+  </header>
+  <main class="login-main">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-heading">
+        <div class="login-title-row">
+          <img class="brand-logo" src="/assets/zpc-logo.png" alt="ZPC" width="96" height="38">
+          <h1 id="login-title">登录工作台</h1>
+        </div>
+        <p>仅限管理员及已授权人员访问</p>
       </div>
-      <div class="form-group">
-        <label for="p">密码</label>
-        <input id="p" type="password" autocomplete="current-password" required placeholder="请输入登录密码">
-      </div>
-      <button type="submit" class="btn" id="submit-btn">验证并进入工作台</button>
-      <div class="err-msg" id="err-msg"></div>
-    </form>
-  </div>
+      <form id="login-form" class="login-form" method="post" onsubmit="handleLogin(event)">
+        <div>
+          <label for="u">账号</label>
+          <input id="u" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required placeholder="请输入授权账号">
+        </div>
+        <div>
+          <label for="p">密码</label>
+          <input id="p" name="password" type="password" autocomplete="current-password" required placeholder="请输入登录密码">
+        </div>
+        <button type="submit" class="login-button" id="submit-btn"><span id="submit-label">进入工作台</span><span aria-hidden="true">→</span></button>
+        <div id="err-msg" class="err-msg" role="alert" hidden></div>
+      </form>
+    </section>
+  </main>
   <script>
-    async function handleLogin(e) {
-      e.preventDefault();
-      const btn = document.getElementById('submit-btn');
-      const err = document.getElementById('err-msg');
-      err.style.display = 'none';
-      btn.disabled = true;
-      btn.textContent = '正在校验...';
+    async function handleLogin(event) {
+      event.preventDefault();
+      const button = document.getElementById('submit-btn');
+      if (button.disabled) return;
+      const label = document.getElementById('submit-label');
+      const error = document.getElementById('err-msg');
+      error.hidden = true;
+      button.disabled = true;
+      label.textContent = '正在验证…';
       try {
-        const res = await fetch('/api/auth/login', {
+        const response = await fetch('/api/auth/login', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
@@ -1327,20 +1309,33 @@ LOGIN_HTML = r"""
             password: document.getElementById('p').value
           })
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '登录失败');
-        location.href = '/';
-      } catch (ex) {
-        err.textContent = ex.message;
-        err.style.display = 'block';
-        btn.disabled = false;
-        btn.textContent = '验证并进入工作台';
+        const data = await response.json().catch(() => null);
+        if (response.ok && data?.ok === true) {
+          location.href = '/';
+          return;
+        }
+        error.textContent = typeof data?.detail === 'string' ? data.detail : '暂时无法登录，请稍后重试。';
+      } catch {
+        error.textContent = '无法连接工作台，请检查网络后重试。';
       }
+      error.hidden = false;
+      button.disabled = false;
+      label.textContent = '进入工作台';
     }
   </script>
 </body>
 </html>
+
 """
+
+
+@app.get("/assets/zpc-logo.png", include_in_schema=False)
+def brand_logo():
+    return FileResponse(
+        WORK_DIR / "assets" / "zpc-logo.png",
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.get("/login", response_class=HTMLResponse)
