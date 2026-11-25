@@ -69,7 +69,7 @@ async def local_request(request: Request, call_next):
     path = request.url.path
     public_paths = (
         "/login", "/api/auth/login", "/api/auth/logout",
-        "/assets/zpc-logo.png", "/assets/gms-prism-world.png",
+        "/assets/zpc-logo.png", "/assets/gms-prism-world.png", "/healthz",
     )
     if path not in public_paths:
         token = request.cookies.get("wb_session")
@@ -1383,6 +1383,8 @@ LOGIN_HTML = r"""
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>登录 · GMS 工作台</title>
+  <link rel="preload" as="image" href="/assets/gms-prism-world.png?v=blue-earth">
+  <link rel="preload" as="image" href="/assets/zpc-logo.png">
   <script>
     try {
       if (localStorage.getItem('gms-workbench-view') === 'review') {
@@ -1423,15 +1425,19 @@ LOGIN_HTML = r"""
       mask-image: radial-gradient(ellipse at center, #000 55%, #000b 76%, transparent 95%);
     }
     .planet-mask, .planet-surface { position: absolute; inset: 0; }
-    .planet-mask { clip-path: circle(33% at 49.5% 48.3%); }
+    .planet-mask {
+      -webkit-mask-image: radial-gradient(circle at 49.5% 48.3%, #000 22%, #000b 29%, transparent 34.5%);
+      mask-image: radial-gradient(circle at 49.5% 48.3%, #000 22%, #000b 29%, transparent 34.5%);
+    }
     .planet-surface {
       background: var(--planet-art) center / 100% no-repeat; opacity: .86;
       transform-origin: 49.5% 48.3%; animation: planet-turn 38s linear infinite;
+      will-change: transform; backface-visibility: hidden;
     }
     .light-beam {
       position: absolute; top: 47%; left: -15%; width: 130%; height: 8%;
       border-radius: 50%; mix-blend-mode: screen; transform-origin: center;
-      filter: blur(2px); opacity: .8;
+      filter: blur(2px); opacity: .8; will-change: transform, opacity; backface-visibility: hidden;
     }
     .light-beam.cool {
       background: radial-gradient(ellipse, #e4faff 0%, #6bbcff9e 13%, #2577c454 39%, transparent 72%);
@@ -1579,21 +1585,32 @@ LOGIN_HTML = r"""
 """
 
 
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"ok": True}
+
+
 @app.get("/assets/zpc-logo.png", include_in_schema=False)
 def brand_logo():
+    webp = WORK_DIR / "assets" / "zpc-logo.webp"
+    if webp.exists():
+        return FileResponse(webp, media_type="image/webp", headers={"Cache-Control": "public, max-age=604800, immutable"})
     return FileResponse(
         WORK_DIR / "assets" / "zpc-logo.png",
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
 
 
 @app.get("/assets/gms-prism-world.png", include_in_schema=False)
 def prism_world():
+    webp = WORK_DIR / "assets" / "gms-prism-world.webp"
+    if webp.exists():
+        return FileResponse(webp, media_type="image/webp", headers={"Cache-Control": "public, max-age=604800, immutable"})
     return FileResponse(
         WORK_DIR / "assets" / "gms-prism-world.png",
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
 
 
