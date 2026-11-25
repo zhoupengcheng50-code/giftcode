@@ -1,5 +1,7 @@
 # 隐私凭据与账号
 session_state.json
+.auth_users.json
+.auth_secret
 debug.log
 *.log
 

@@ -16,9 +16,17 @@ import webbrowser
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
+from auth_manager import (
+    add_user as auth_add_user,
+    authenticate as auth_authenticate,
+    create_session_token,
+    delete_user as auth_delete_user,
+    list_users as auth_list_users,
+    verify_session_token,
+)
 from auto_gift_code import GiftCodeAutomator, batch_suffix, is_batch_date
 from credentials import load as load_credentials
 from unified_parser import TIERS, parse_any_file, parse_text_rows, parse_tiers, reward_name
@@ -46,7 +54,7 @@ RESULT = None
 @app.middleware("http")
 async def local_request(request: Request, call_next):
     origin = request.headers.get("origin")
-    if request.method == "POST":
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
         if request.headers.get("sec-fetch-site") == "cross-site":
             return JSONResponse({"detail": "拒绝跨站请求"}, status_code=403)
         if origin:
@@ -55,9 +63,97 @@ async def local_request(request: Request, call_next):
             req_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).lower().split(':')[0]
             if origin_host != req_host and origin_host not in ("127.0.0.1", "localhost", "0.0.0.0"):
                 return JSONResponse({"detail": "非法请求来源"}, status_code=403)
+
+    path = request.url.path
+    public_paths = ("/login", "/api/auth/login", "/api/auth/logout")
+    if path not in public_paths:
+        token = request.cookies.get("wb_session")
+        user = verify_session_token(token)
+        if not user:
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "未授权访问，请先登录"}, status_code=401)
+            return RedirectResponse(url="/login", status_code=302)
+        request.state.user = user
+        if path.startswith("/api/users") and user.get("role") != "admin":
+            return JSONResponse({"detail": "仅最高权限管理员可管理账号"}, status_code=403)
+
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
     return response
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.post("/api/auth/login")
+async def api_login(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求格式无效")
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    ok, role, msg = auth_authenticate(username, password, _client_ip(request))
+    if not ok:
+        return JSONResponse({"detail": msg}, status_code=401)
+    token = create_session_token(username, role)
+    resp = JSONResponse({"ok": True, "username": username, "role": role})
+    is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+    resp.set_cookie(
+        key="wb_session",
+        value=token,
+        max_age=24 * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/api/auth/logout")
+def api_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("wb_session", path="/")
+    return resp
+
+
+@app.get("/api/auth/me")
+def api_me(request: Request):
+    user = getattr(request.state, "user", {})
+    return {"username": user.get("sub", ""), "role": user.get("role", "user")}
+
+
+@app.get("/api/users")
+def api_list_users():
+    return {"users": auth_list_users()}
+
+
+@app.post("/api/users")
+async def api_add_user(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求格式无效")
+    ok, msg = auth_add_user(str(payload.get("username", "")), str(payload.get("password", "")))
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "message": msg, "users": auth_list_users()}
+
+
+@app.delete("/api/users/{username}")
+def api_delete_user(username: str):
+    ok, msg = auth_delete_user(username)
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "message": msg, "users": auth_list_users()}
 
 
 @app.get("/api/config")
@@ -680,6 +776,25 @@ WORKBENCH_HTML = r"""
       display: none;
     }
     .download-card h3 { color: #34d399; font-size: 18px; margin-bottom: 8px; }
+    .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 6px; min-height: 32px; width: auto; }
+    .btn-outline { background: #1e293b; border: 1px solid #475569; color: #38bdf8; }
+    .btn-outline:hover { background: #334155; border-color: #38bdf8; }
+    .btn-danger-outline { background: rgba(220,38,38,0.12); border: 1px solid #ef4444; color: #fca5a5; }
+    .btn-danger-outline:hover { background: rgba(220,38,38,0.25); }
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72); backdrop-filter: blur(4px);
+      display: none; align-items: center; justify-content: center; z-index: 999; padding: 16px;
+    }
+    .modal-card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px;
+      max-width: 480px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+    }
+    .user-list { margin-top: 14px; max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+    .user-item {
+      display: flex; justify-content: space-between; align-items: center; padding: 8px 12px;
+      background: #0f172a; border: 1px solid #334155; border-radius: 6px; font-size: 13px;
+    }
   </style>
 </head>
 <body>
@@ -689,7 +804,10 @@ WORKBENCH_HTML = r"""
         <h1>🎮 越南后台GMS礼包码自动配置工作台</h1>
         <p>支持文档直接解析（.docx/.xlsx/.txt/直接粘贴）、多档位自动配置与合并 .xls 表格直出</p>
       </div>
-      <div>
+      <div class="header-actions">
+        <span id="current-user-badge" class="badge badge-idle">校验中...</span>
+        <button id="manage-users-btn" class="btn btn-sm btn-outline" style="display:none;" onclick="openUsersModal()">👥 账号管理</button>
+        <button class="btn btn-sm btn-danger-outline" onclick="logout()">🚪 退出</button>
         <span id="global-badge" class="badge badge-idle">服务在线</span>
       </div>
     </header>
@@ -1000,10 +1118,236 @@ WORKBENCH_HTML = r"""
     call('/api/config').then(status => {
       if (status.credentials_saved) get('username').placeholder = '账号已保存，可留空';
     }).catch(error => { get('status-text').textContent = error.message; });
+
+    call('/api/auth/me').then(me => {
+      const badge = get('current-user-badge');
+      badge.textContent = (me.role === 'admin' ? '👑 管理员: ' : '👤 ') + me.username;
+      if (me.role === 'admin') {
+        badge.className = 'badge badge-success';
+        get('manage-users-btn').style.display = 'inline-flex';
+      }
+    }).catch(() => { location.href = '/login'; });
+
+    async function logout() {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      location.href = '/login';
+    }
+
+    function openUsersModal() {
+      get('users-modal').style.display = 'flex';
+      get('user-msg').textContent = '';
+      loadUsers();
+    }
+
+    function closeUsersModal() {
+      get('users-modal').style.display = 'none';
+    }
+
+    async function loadUsers() {
+      const data = await call('/api/users');
+      const box = get('user-list');
+      box.replaceChildren();
+      (data.users || []).forEach(u => {
+        const item = document.createElement('div');
+        item.className = 'user-item';
+        const info = document.createElement('div');
+        const strong = document.createElement('strong');
+        strong.style.color = u.role === 'admin' ? '#4ade80' : '#f8fafc';
+        strong.textContent = u.username;
+        const roleSpan = document.createElement('span');
+        roleSpan.style.cssText = 'color:#64748b;font-size:12px;margin-left:6px;';
+        roleSpan.textContent = u.role === 'admin' ? '(最高管理员)' : '(授权用户)';
+        info.append(strong, roleSpan);
+        item.appendChild(info);
+        if (u.role !== 'admin') {
+          const delBtn = document.createElement('button');
+          delBtn.className = 'btn btn-sm btn-danger-outline';
+          delBtn.textContent = '移除';
+          delBtn.onclick = async () => {
+            if (!confirm(`确认吊销账号「${u.username}」的登录权限？`)) return;
+            await fetch(`/api/users/${encodeURIComponent(u.username)}`, { method: 'DELETE' });
+            loadUsers();
+          };
+          item.appendChild(delBtn);
+        }
+        box.appendChild(item);
+      });
+    }
+
+    async function addAuthorizedUser() {
+      const uname = get('new-auth-user').value.trim();
+      const upass = get('new-auth-pass').value;
+      const msgEl = get('user-msg');
+      msgEl.textContent = '';
+      try {
+        await call('/api/users', { username: uname, password: upass });
+        get('new-auth-user').value = '';
+        get('new-auth-pass').value = '';
+        msgEl.style.color = '#4ade80';
+        msgEl.textContent = '✅ 授权账号添加成功';
+        loadUsers();
+      } catch (e) {
+        msgEl.style.color = '#f87171';
+        msgEl.textContent = e.message;
+      }
+    }
+  </script>
+
+  <div class="modal-overlay" id="users-modal" onclick="if(event.target===this) closeUsersModal()">
+    <div class="modal-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+        <h3 style="color:#38bdf8;font-size:17px;">👥 授权账号权限管理</h3>
+        <button class="btn btn-sm btn-outline" onclick="closeUsersModal()">关闭</button>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>新授权账号</label>
+          <input type="text" id="new-auth-user" placeholder="输入用户名(2~32位)">
+        </div>
+        <div class="form-group">
+          <label>登录密码</label>
+          <input type="password" id="new-auth-pass" placeholder="设置密码(至少4位)">
+        </div>
+      </div>
+      <button class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">➕ 添加并授权该账号</button>
+      <div id="user-msg" style="font-size:13px;margin-top:8px;"></div>
+      <div style="margin-top:16px;font-size:13px;color:#94a3b8;font-weight:600;">当前已授权账号列表：</div>
+      <div class="user-list" id="user-list"></div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+LOGIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>安全登录 - 越南后台GMS礼包码配置工作台</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 400px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 28px 24px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .login-header { text-align: center; margin-bottom: 24px; }
+    .login-header h1 { font-size: 20px; color: #38bdf8; margin-bottom: 6px; }
+    .login-header p { font-size: 13px; color: #94a3b8; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; font-weight: 500; }
+    input {
+      width: 100%;
+      padding: 11px 12px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f8fafc;
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus { border-color: #38bdf8; }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      min-height: 44px;
+      transition: background 0.2s;
+    }
+    .btn:hover:not(:disabled) { background: #1d4ed8; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .err-msg {
+      margin-top: 14px;
+      padding: 10px 12px;
+      background: rgba(220, 38, 38, 0.15);
+      border: 1px solid #ef4444;
+      border-radius: 8px;
+      color: #fca5a5;
+      font-size: 13px;
+      display: none;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-header">
+      <h1>🔐 工作台安全校验</h1>
+      <p>仅限管理员及已授权人员登录访问</p>
+    </div>
+    <form id="login-form" onsubmit="handleLogin(event)">
+      <div class="form-group">
+        <label for="u">账号</label>
+        <input id="u" type="text" autocomplete="username" required placeholder="请输入授权账号">
+      </div>
+      <div class="form-group">
+        <label for="p">密码</label>
+        <input id="p" type="password" autocomplete="current-password" required placeholder="请输入登录密码">
+      </div>
+      <button type="submit" class="btn" id="submit-btn">验证并进入工作台</button>
+      <div class="err-msg" id="err-msg"></div>
+    </form>
+  </div>
+  <script>
+    async function handleLogin(e) {
+      e.preventDefault();
+      const btn = document.getElementById('submit-btn');
+      const err = document.getElementById('err-msg');
+      err.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = '正在校验...';
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            username: document.getElementById('u').value.trim(),
+            password: document.getElementById('p').value
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '登录失败');
+        location.href = '/';
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = '验证并进入工作台';
+      }
+    }
   </script>
 </body>
 </html>
 """
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if verify_session_token(request.cookies.get("wb_session")):
+        return RedirectResponse(url="/", status_code=302)
+    return LOGIN_HTML
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1014,11 +1358,10 @@ def index():
 def open_running_workbench():
     url = "http://127.0.0.1:8888"
     try:
-        with urlopen(f"{url}/api/status", timeout=1.5) as response:
-            state = json.load(response)
-    except (OSError, ValueError):
-        return False
-    if not isinstance(state, dict) or not {"running", "preview", "download"} <= state.keys():
+        with urlopen(f"{url}/login", timeout=1.5) as response:
+            if response.status != 200:
+                return False
+    except OSError:
         return False
     webbrowser.open(url)
     return True
