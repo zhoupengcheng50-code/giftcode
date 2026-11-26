@@ -10,9 +10,16 @@ ROOT = Path(os.environ.get('WORKBENCH_DATA_DIR', Path(__file__).resolve().parent
 def connect():
     if not DATABASE_URL:
         raise RuntimeError('云端必须设置 DATABASE_URL')
+    import certifi
     import psycopg
-    # Require both certificate and hostname validation regardless of URI parameters.
-    return psycopg.connect(DATABASE_URL, sslmode='verify-full', connect_timeout=15)
+
+    # The container does not ship with a per-user PostgreSQL root certificate.
+    return psycopg.connect(
+        DATABASE_URL,
+        sslmode='verify-full',
+        sslrootcert=certifi.where(),
+        connect_timeout=15,
+    )
 
 
 def initialize():
