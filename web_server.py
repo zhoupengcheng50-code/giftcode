@@ -173,10 +173,10 @@ async def api_add_user(request: Request):
         payload = await request.json()
     except Exception:
         raise HTTPException(400, "请求格式无效")
-    ok, msg = auth_add_user(str(payload.get("username", "")), str(payload.get("password", "")))
+    ok, msg = await asyncio.to_thread(auth_add_user, str(payload.get("username", "")), str(payload.get("password", "")))
     if not ok:
         raise HTTPException(400, msg)
-    return {"ok": True, "message": msg, "users": auth_list_users()}
+    return {"ok": True, "message": msg, "users": await asyncio.to_thread(auth_list_users)}
 
 
 @app.delete("/api/users/{username}")
@@ -1347,11 +1347,23 @@ WORKBENCH_HTML = r"""
       get('users-modal').style.display = 'none';
     }
 
+    let usersRequestVersion = 0;
     async function loadUsers() {
-      const data = await call('/api/users');
+      const requestVersion = ++usersRequestVersion;
+      const box = get('user-list');
+      box.textContent = '正在加载账号列表…';
+      try {
+        const data = await call('/api/users');
+        if (requestVersion === usersRequestVersion) renderUsers(data.users || []);
+      } catch (error) {
+        if (requestVersion === usersRequestVersion) box.textContent = '账号列表加载失败：' + error.message;
+      }
+    }
+
+    function renderUsers(users) {
       const box = get('user-list');
       box.replaceChildren();
-      (data.users || []).forEach(u => {
+      users.forEach(u => {
         const item = document.createElement('div');
         item.className = 'user-item';
         const info = document.createElement('div');
@@ -1382,17 +1394,25 @@ WORKBENCH_HTML = r"""
       const uname = get('new-auth-user').value.trim();
       const upass = get('new-auth-pass').value;
       const msgEl = get('user-msg');
-      msgEl.textContent = '';
+      const button = get('add-user-btn');
+      button.disabled = true;
+      button.textContent = '正在添加，请稍候…';
+      msgEl.style.color = '#94a3b8';
+      msgEl.textContent = '正在保存账号，请勿重复点击';
       try {
-        await call('/api/users', { username: uname, password: upass });
+        const data = await call('/api/users', { username: uname, password: upass });
+        ++usersRequestVersion;
+        renderUsers(data.users || []);
         get('new-auth-user').value = '';
         get('new-auth-pass').value = '';
         msgEl.style.color = '#4ade80';
-        msgEl.textContent = '✅ 授权账号添加成功';
-        loadUsers();
+        msgEl.textContent = '✅ 已保存账号：' + uname;
       } catch (e) {
         msgEl.style.color = '#f87171';
-        msgEl.textContent = e.message;
+        msgEl.textContent = e.message + '。如果网络中断，请刷新账号列表确认后再试。';
+      } finally {
+        button.disabled = false;
+        button.textContent = '添加授权账号';
       }
     }
   </script>
@@ -1413,7 +1433,7 @@ WORKBENCH_HTML = r"""
           <input type="password" id="new-auth-pass" placeholder="设置密码(至少12位)">
         </div>
       </div>
-      <button class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">添加授权账号</button>
+      <button id="add-user-btn" class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">添加授权账号</button>
       <div id="user-msg" style="font-size:13px;margin-top:8px;"></div>
       <div style="margin-top:16px;font-size:13px;color:#94a3b8;font-weight:600;">当前已授权账号列表：</div>
       <div class="user-list" id="user-list"></div>

@@ -243,6 +243,8 @@ def add_user(username: str, password: str) -> tuple[bool, str]:
 
     with _LOCK:
         users = _load_users()
+        if username in users:
+            return False, "该账号已存在，请勿重复添加"
         users[username] = {
             "password_hash": hash_password(password),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
