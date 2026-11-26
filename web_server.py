@@ -13,6 +13,8 @@ import threading
 from urllib.request import urlopen
 from uuid import uuid4
 import webbrowser
+import zipfile
+import io
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -26,16 +28,27 @@ from auth_manager import (
     delete_user as auth_delete_user,
     list_users as auth_list_users,
     verify_session_token,
+    _admin_hash,
 )
 from auto_gift_code import GiftCodeAutomator, batch_suffix, is_batch_date
 from credentials import load as load_credentials
 from unified_parser import TIERS, parse_any_file, parse_text_rows, parse_tiers, reward_name
 
 WORK_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("WORKBENCH_DATA_DIR", WORK_DIR)).resolve()
+CLOUD = os.environ.get("WORKBENCH_CLOUD") == "1"
 
 
 @asynccontextmanager
 async def lifespan(app):
+    if CLOUD:
+        if not os.environ.get("WORKBENCH_DATA_DIR") or not os.environ.get("WORKBENCH_PUBLIC_HOST"):
+            raise RuntimeError("云端必须设置 WORKBENCH_DATA_DIR 和 WORKBENCH_PUBLIC_HOST")
+        if not os.path.ismount(DATA_DIR):
+            raise RuntimeError("WORKBENCH_DATA_DIR 必须是持久化磁盘挂载点；拒绝使用临时文件系统")
+        if len(os.environ.get("WORKBENCH_SECRET", "")) < 32:
+            raise RuntimeError("云端必须设置至少 32 字符的 WORKBENCH_SECRET")
+    _admin_hash()
     if "--open" in sys.argv:
         browser_timer = threading.Timer(1, webbrowser.open, args=("http://127.0.0.1:8888",))
         browser_timer.daemon = True
@@ -44,13 +57,15 @@ async def lifespan(app):
 
 
 app = FastAPI(title="越南礼包码自动化工作台", lifespan=lifespan)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=[os.environ["WORKBENCH_PUBLIC_HOST"]] if CLOUD and os.environ.get("WORKBENCH_PUBLIC_HOST") else ["127.0.0.1", "localhost", "[::1]"])
 LOCK = threading.Lock()
 STATUS = {"running": False, "mode": "", "progress": 0, "tier": "", "action": "", "logs": [], "error": None}
 PREVIEW = None
 RESULT = None
 ACTIVE_BROWSER = None
 ACTIVE_RUN_ID = None
+CANCEL_EVENT = None
+TASK_OWNER = None
 
 
 @app.middleware("http")
@@ -61,9 +76,8 @@ async def local_request(request: Request, call_next):
             return JSONResponse({"detail": "拒绝跨站请求"}, status_code=403)
         if origin:
             from urllib.parse import urlparse
-            origin_host = urlparse(origin).netloc.lower().split(':')[0]
-            req_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).lower().split(':')[0]
-            if origin_host != req_host and origin_host not in ("127.0.0.1", "localhost", "0.0.0.0"):
+            origin_url = urlparse(origin)
+            if origin_url.scheme != ("https" if CLOUD else request.url.scheme) or origin_url.netloc.lower() != request.url.netloc.lower():
                 return JSONResponse({"detail": "非法请求来源"}, status_code=403)
 
     path = request.url.path
@@ -83,6 +97,14 @@ async def local_request(request: Request, call_next):
             return JSONResponse({"detail": "仅最高权限管理员可管理账号"}, status_code=403)
 
     response = await call_next(request)
+    if path in {"/api/auth/login", "/api/auth/logout", "/api/users", "/api/preview", "/api/start", "/api/stop"} or path.startswith("/api/users/"):
+        if request.method in {"POST", "DELETE"}:
+            actor = getattr(request.state, "user", {}).get("sub", "anonymous")
+            try:
+                with (DATA_DIR / "audit.log").open("a", encoding="utf-8") as audit:
+                    audit.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "actor": actor, "method": request.method, "path": path, "status": response.status_code}, ensure_ascii=False) + "\n")
+            except OSError:
+                pass
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -91,9 +113,6 @@ async def local_request(request: Request, call_next):
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -108,9 +127,10 @@ async def api_login(request: Request):
     ok, role, msg = auth_authenticate(username, password, _client_ip(request))
     if not ok:
         return JSONResponse({"detail": msg}, status_code=401)
+    request.state.user = {"sub": username, "role": role}
     token = create_session_token(username, role)
     resp = JSONResponse({"ok": True, "username": username, "role": role})
-    is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+    is_https = CLOUD or request.url.scheme == "https"
     resp.set_cookie(
         key="wb_session",
         value=token,
@@ -167,7 +187,7 @@ def config():
         saved = bool(load_credentials()[0])
     except OSError:
         saved = False
-    return {"credentials_saved": saved}
+    return {"credentials_saved": saved and not CLOUD}
 
 
 def invalid(exc):
@@ -224,6 +244,11 @@ async def upload(file: UploadFile = File(...)):
     if len(data) > 10_000_000:
         raise HTTPException(413, "文件不能超过 10 MB")
     try:
+        if suffix in {".docx", ".xlsx"}:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                entries = archive.infolist()
+                if len(entries) > 2000 or sum(i.file_size for i in entries) > 50_000_000:
+                    raise ValueError("文档解压后过大或包含过多文件")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ("upload" + suffix)
             path.write_bytes(data)
@@ -269,8 +294,10 @@ def validate_job(data):
         raise ValueError("失效时间格式应为 YYYY-MM-DD HH:MM:SS") from exc
     if parsed_expiry.isoformat(sep=" ") != expiry:
         raise ValueError("失效时间格式应为 YYYY-MM-DD HH:MM:SS")
-    if type(count) is not int or not 1 <= count <= 65535:
-        raise ValueError("单档生成数量必须是 1–65535 的整数")
+    if parsed_expiry <= datetime.now(UPLOAD_TIMEZONE).replace(tzinfo=None):
+        raise ValueError("失效时间必须晚于当前北京时间，请确认 GMS 时区一致")
+    if type(count) is not int or not 1 <= count <= 5000:
+        raise ValueError("单档生成数量必须是 1–5000 的整数")
     rewards = data.get("rewards")
     if not isinstance(rewards, dict) or set(rewards) != set(TIERS):
         raise ValueError("请上传包含八档奖励的活动文档")
@@ -289,7 +316,7 @@ def validate_job(data):
         job["batch_date"] = batch
     job_key = hashlib.sha256(json.dumps(job, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     job["batch_date"] = batch
-    job["directory"] = WORK_DIR / "jobs" / job_key
+    job["directory"] = DATA_DIR / "jobs" / job_key
     user, password = data.get("username", ""), data.get("password", "")
     if not isinstance(user, str) or not isinstance(password, str) or bool(user.strip()) != bool(password):
         raise ValueError("请同时填写后台账号和密码")
@@ -402,8 +429,8 @@ def start_worker(mode, job, run_id):
                 ACTIVE_RUN_ID = None
 
 
-def enqueue(mode, data):
-    global PREVIEW, RESULT, ACTIVE_RUN_ID
+def enqueue(mode, data, owner):
+    global PREVIEW, RESULT, ACTIVE_RUN_ID, CANCEL_EVENT, TASK_OWNER
     try:
         job = validate_job(data)
     except ValueError as exc:
@@ -412,9 +439,13 @@ def enqueue(mode, data):
         if STATUS["running"]:
             raise HTTPException(409, "已有任务正在执行，如需重来请先点击停止任务")
         if mode == "execute":
+            if TASK_OWNER != owner:
+                raise HTTPException(403, "只能执行本人核对的任务")
             if not PREVIEW or PREVIEW["token"] != data.get("preview_token") or PREVIEW["path"] != job["directory"]:
                 raise HTTPException(409, "活动参数或奖励已变化，请重新核对往期")
             job["plan"] = PREVIEW["value"]
+            if any(row["status"] == "kept" for tier in job["plan"]["tiers"].values() for row in tier["items"]) and data.get("confirm_extra_rewards") is not True:
+                raise HTTPException(409, "请确认预览中保留的后台额外奖励")
             if any(row["status"] == "review" for tier in job["plan"]["tiers"].values() for row in tier["items"]):
                 raise HTTPException(409, "预览中仍有待核对的奖励")
         else:
@@ -422,46 +453,51 @@ def enqueue(mode, data):
         RESULT = None
         run_id = uuid4().hex
         ACTIVE_RUN_ID = run_id
+        TASK_OWNER = owner
+        CANCEL_EVENT = threading.Event()
+        job["cancel_event"] = CANCEL_EVENT
         STATUS.update(running=True, mode=mode, progress=0, tier="", action="正在启动任务...", logs=[], error=None)
     threading.Thread(target=start_worker, args=(mode, job, run_id), daemon=True).start()
     return {"status": "started"}
 
 
 @app.post("/api/stop")
-def stop_task():
-    global ACTIVE_BROWSER, ACTIVE_RUN_ID
+def stop_task(request: Request):
     with LOCK:
-        browser = ACTIVE_BROWSER
-        ACTIVE_BROWSER = None
-        ACTIVE_RUN_ID = None
-        if STATUS["running"]:
-            STATUS["logs"].append({"text": "任务已被手动强制断开。", "level": "WARN"})
-        STATUS.update(running=False, error="任务已手动停止", action="已手动停止")
-    if browser is not None:
-        threading.Thread(target=lambda b: b.close(), args=(browser,), daemon=True).start()
-    return {"status": "stopped"}
+        if STATUS["running"] and TASK_OWNER != request.state.user["sub"]:
+            raise HTTPException(403, "只有任务发起人可以停止任务")
+        if STATUS["running"] and CANCEL_EVENT:
+            CANCEL_EVENT.set()
+            STATUS["logs"].append({"text": "已请求停止；当前请求结束后停止，已提交操作可能生效。", "level": "WARN"})
+            STATUS["action"] = "正在停止，等待当前后台请求结束"
+            return {"status": "stopping"}
+    return {"status": "idle"}
 
 
 @app.post("/api/preview")
-def preview(data: dict):
-    return enqueue("preview", data)
+def preview(data: dict, request: Request):
+    return enqueue("preview", data, request.state.user["sub"])
 
 
 @app.post("/api/start")
-def start(data: dict):
-    return enqueue("execute", data)
+def start(data: dict, request: Request):
+    return enqueue("execute", data, request.state.user["sub"])
 
 
 @app.get("/api/status")
-def status():
+def status(request: Request):
     with LOCK:
+        if TASK_OWNER and TASK_OWNER != request.state.user["sub"]:
+            return {"running": STATUS["running"], "mode": "", "progress": 0, "tier": "", "action": "其他用户正在执行任务" if STATUS["running"] else "", "logs": [], "error": None, "preview": None, "download": False}
         preview = {"token": PREVIEW["token"], **PREVIEW["value"]} if PREVIEW else None
         return {**STATUS, "logs": STATUS["logs"][:], "preview": preview, "download": RESULT is not None}
 
 
 @app.get("/api/download/xls")
-def download():
+def download(request: Request):
     with LOCK:
+        if TASK_OWNER != request.state.user["sub"]:
+            raise HTTPException(403, "只能下载本人任务的结果")
         result = RESULT
     if result is None or not result.is_file():
         raise HTTPException(404, "本次任务还没有可用文件")
@@ -836,7 +872,7 @@ WORKBENCH_HTML = r"""
                 </div>
                 <div class="form-group">
                   <label for="code-count">单档生成数量</label>
-                  <input type="number" id="code-count" min="1" max="65535" value="100">
+                  <input type="number" id="code-count" min="1" max="5000" value="100">
                 </div>
               </div>
               <details class="access-settings">
@@ -1153,6 +1189,7 @@ WORKBENCH_HTML = r"""
         username: get('username').value,
         password: get('password').value,
         rewards,
+        confirm_extra_rewards: true,
         preview_token: preview?.token
       };
       if (mode === 'preview') clearPreview();
@@ -1181,7 +1218,11 @@ WORKBENCH_HTML = r"""
     }
 
     function runPreview() { return run('preview'); }
-    function startAutomation() { return run('execute'); }
+    function startAutomation() {
+      const extras = preview && Object.values(preview.tiers).flatMap(t => t.items).filter(r => r.status === 'kept');
+      if (extras?.length && !confirm('预览包含 ' + extras.length + ' 项后台额外奖励，将继续保留。请先逐档核对，确认继续生成？')) return;
+      return run('execute');
+    }
 
     async function stopTask() {
       const btn = get('stop-btn');
@@ -1190,9 +1231,8 @@ WORKBENCH_HTML = r"""
         await call('/api/stop', {});
       } catch (_) {}
       clearTimeout(timer);
-      running = false;
       btn.disabled = false;
-      get('status-text').textContent = '任务已手动停止';
+      get('status-text').textContent = '正在停止，已提交的后台操作可能生效';
       setControls();
       poll();
     }
@@ -1216,8 +1256,7 @@ WORKBENCH_HTML = r"""
         running = false;
         if (status.mode === 'preview' && !status.error) {
           preview = status.preview;
-          get('username').value = '';
-          get('password').value = '';
+          // 云端不保存后台密码，生成时继续使用本页面输入的凭据。
           const config = await call('/api/config');
           if (config.credentials_saved) get('username').placeholder = '账号已保存，可留空';
         }
@@ -1363,7 +1402,7 @@ WORKBENCH_HTML = r"""
         </div>
         <div class="form-group">
           <label for="new-auth-pass">登录密码</label>
-          <input type="password" id="new-auth-pass" placeholder="设置密码(至少4位)">
+          <input type="password" id="new-auth-pass" placeholder="设置密码(至少12位)">
         </div>
       </div>
       <button class="btn btn-primary" style="width:100%;" onclick="addAuthorizedUser()">添加授权账号</button>
@@ -1638,4 +1677,4 @@ def open_running_workbench():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8888))
     if "--open" not in sys.argv or not open_running_workbench():
-        uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+        uvicorn.run(app, host="0.0.0.0" if CLOUD else "127.0.0.1", port=port, proxy_headers=False)

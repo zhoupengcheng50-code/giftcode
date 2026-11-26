@@ -1,16 +1,11 @@
-# 隐私凭据与账号
-session_state.json
-.auth_users.json
 .auth_secret
-debug.log
-*.log
-
-# 任务导出与生成文件
+.admin_hash
+.auth_users.json
+首次登录密码.txt
 jobs/
-封存/
 __pycache__/
 *.pyc
-
-# 临时系统文件
-.DS_Store
-Thumbs.db
+*.log
+*.xls
+*.xlsx
+*.docx

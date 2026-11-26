@@ -13,6 +13,7 @@
 import copy
 import json
 import os
+import os
 import re
 import time
 from datetime import datetime
@@ -108,23 +109,30 @@ class GiftCodeAutomator:
         self.expire_date_str = str(job["expire_time"]).strip()
         self.code_count = int(job.get("count", 100))
         self.session: Optional[requests.Session] = None
+        self.cancel_event = job.get("cancel_event")
 
     # ==================== HTTP 直连与 Dorado7 通讯核心 ====================
 
     def _init_session(self):
         """初始化 HTTP 会话并设置请求头"""
         s = requests.Session()
-        s.verify = False
+        # Verify the server certificate; optionally trust an explicitly configured CA bundle.
+        s.verify = os.environ.get("GMS_CA_BUNDLE") or True
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
         self.session = s
 
+    def check_cancelled(self):
+        if self.cancel_event and self.cancel_event.is_set():
+            raise RuntimeError("任务已停止；已提交的后台请求可能仍已生效，请重新核对后恢复。")
+
     def login_http(self):
         """HTTP 直连登录 GMS 后台"""
         self.log(f"正在通过 HTTP 直连连接后台系统: {self.base_url}...")
         self.set_progress(5, "系统初始化", "正在连接后台系统...")
+        self.check_cancelled()
         self._init_session()
 
         login_url = f"{self.base_url}/login.jsp"
@@ -170,11 +178,18 @@ class GiftCodeAutomator:
         except Exception:
             pass
 
+        if self.job.get("credentials"):
+            try:
+                save_credentials(self.username, self.password)
+            except OSError:
+                self.log("无法保存后台凭据，本次任务继续运行。", "WARN")
+
         self.log("成功进入后台系统并建立直连会话！", "SUCCESS")
         self.set_progress(10, "系统就绪", "成功进入后台系统")
 
     def post_view_service(self, inner_obj: Dict[str, Any]) -> Dict[str, Any]:
         """向 Dorado7 view-service 发送批量 XML/JSON 请求并解析响应"""
+        self.check_cancelled()
         if self.session is None:
             self.login_http()
 
@@ -214,6 +229,10 @@ class GiftCodeAutomator:
         start = text.find("<![CDATA[")
         end = text.find("]]>", start)
         if start == -1 or end == -1 or end <= start:
+            # 不自动重试写入请求，避免因响应异常而重复创建或发码。
+            if inner_obj.get("action") != "load-data":
+                raise RuntimeError("后台写入响应异常，结果未知；请核对后台后再恢复，禁止自动重试。")
+            self.check_cancelled()
             # 会话失效重试
             self.log("检测到后台会话可能已过期，正在自动重登并重试...", "WARN")
             self.login_http()
@@ -720,7 +739,7 @@ class GiftCodeAutomator:
             if differences:
                 raise RuntimeError(f"{tier} 档保存后仍存在奖励差异：{', '.join(d['name'] for d in differences)}")
 
-            self.log(f"✅ 档位 [{tier}] 奖励配置核验通过：与上传表格配置 100% 一致！", "SUCCESS")
+            self.log(f"✅ 档位 [{tier}] 文档奖励核验通过；后台额外奖励按预览保留。", "SUCCESS")
             activities[tier] = {"id": activity_id, "name": item["target"]}
 
         # 阶段 2：逐档发码并导出
@@ -768,14 +787,6 @@ class GiftCodeAutomator:
 
     def run(self, mode: str):
         """外部统一入口"""
-        if self.job.get("credentials"):
-            try:
-                save_credentials(self.username, self.password)
-            except OSError as exc:
-                if getattr(exc, "winerror", None) != 1312:
-                    raise
-                self.log("当前 Windows 会话无法保存密码，将继续使用已验证的 GMS 会话。", "WARN")
-
         if mode == "preview":
             return self.preview()
         elif mode == "execute":

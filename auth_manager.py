@@ -12,14 +12,15 @@ import time
 
 ADMIN_USER = "admin-zpc"
 # 管理员初始密码的 PBKDF2-HMAC-SHA256 (200,000 次迭代) 加盐哈希，源码不留存明文密码
-ADMIN_HASH = "b4a36781db59adf88762425b696355d7:52714d68bdba5974539874ee460997e3ca0a45aba093a7d2958b57942c975641"
+ADMIN_HASH = None
 
 PBKDF2_ITERATIONS = 200_000
 SESSION_TTL = 24 * 3600  # 会话有效期 24 小时
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 15 * 60  # 连续失败 5 次锁定 15 分钟
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.environ.get("WORKBENCH_DATA_DIR", Path(__file__).resolve().parent)).resolve()
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 USERS_FILE = BASE_DIR / ".auth_users.json"
 SECRET_FILE = BASE_DIR / ".auth_secret"
 
@@ -31,7 +32,11 @@ _LOCKED_UNTIL: dict[str, float] = {}  # ip -> unlock_timestamp
 def _get_secret() -> bytes:
     env_secret = os.environ.get("WORKBENCH_SECRET")
     if env_secret:
+        if len(env_secret) < 32:
+            raise RuntimeError("WORKBENCH_SECRET 至少需要 32 个字符")
         return hashlib.sha256(env_secret.encode("utf-8")).digest()
+    if os.environ.get("WORKBENCH_CLOUD") == "1":
+        raise RuntimeError("云端必须设置 WORKBENCH_SECRET")
     with _LOCK:
         if SECRET_FILE.exists():
             try:
@@ -52,6 +57,25 @@ def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
     return f"{salt.hex()}:{dk.hex()}"
+
+
+def _admin_hash():
+    """Initialize a unique administrator password on first launch."""
+    admin_password = os.environ.get("WORKBENCH_ADMIN_PASSWORD")
+    if admin_password:
+        if len(admin_password) < 16:
+            raise RuntimeError("WORKBENCH_ADMIN_PASSWORD 至少需要 16 个字符")
+        return hash_password(admin_password)
+    if os.environ.get("WORKBENCH_CLOUD") == "1":
+        raise RuntimeError("云端必须设置 WORKBENCH_ADMIN_PASSWORD")
+    admin_file = BASE_DIR / ".admin_hash"
+    with _LOCK:
+        if not admin_file.exists():
+            password = secrets.token_urlsafe(18)
+            admin_file.write_text(hash_password(password), encoding="utf-8")
+            (BASE_DIR / "首次登录密码.txt").write_text(
+                f"账号: {ADMIN_USER}\n初始密码: {password}\n请妥善保管并在记录后删除此文件。\n", encoding="utf-8")
+        return admin_file.read_text(encoding="utf-8").strip()
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
@@ -127,8 +151,9 @@ def authenticate(username: str, password: str, client_ip: str) -> tuple[bool, st
     if not username or not password:
         return False, None, "请输入账号和密码"
 
+    admin_hash = _admin_hash()
     if hmac.compare_digest(username, ADMIN_USER):
-        if verify_password(password, ADMIN_HASH):
+        if verify_password(password, admin_hash):
             _clear_failures(client_ip)
             return True, "admin", ""
         rem = _record_failure(client_ip)
@@ -143,7 +168,7 @@ def authenticate(username: str, password: str, client_ip: str) -> tuple[bool, st
         return True, "user", ""
 
     # 即使用户名不存在，也执行一次空哈希以平衡响应时间，防止用户名枚举
-    verify_password(password, ADMIN_HASH)
+    verify_password(password, admin_hash)
     rem = _record_failure(client_ip)
     msg = "账号或密码错误" if rem > 0 else "连续失败次数过多，该 IP 已被锁定 15 分钟"
     return False, None, msg
@@ -206,8 +231,8 @@ def add_user(username: str, password: str) -> tuple[bool, str]:
         return False, "用户名不能包含空格或特殊斜杠字符"
     if username == ADMIN_USER:
         return False, "不能覆盖最高权限管理员账号"
-    if not password or len(password) < 4 or len(password) > 64:
-        return False, "密码长度需在 4~64 个字符之间"
+    if not password or len(password) < 12 or len(password) > 64:
+        return False, "密码长度需在 12~64 个字符之间"
 
     with _LOCK:
         users = _load_users()

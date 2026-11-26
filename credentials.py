@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-TARGET = "VietnamGiftWorkbench/GMS"
+TARGET = "VietnamGiftWorkbenchOptimized/GMS"
 
 if sys.platform == "win32":
     import ctypes as ct
@@ -48,20 +48,9 @@ if sys.platform == "win32":
         if not api.CredWriteW(ct.byref(credential), 0):
             raise ct.WinError(ct.get_last_error())
 else:
-    # Linux / 云端容器兼容存储
-    _FILE = Path(os.environ.get("CRED_DIR", tempfile.gettempdir() if "tempfile" in globals() else "/tmp")) / ".gms_credentials.json"
-
+    # Do not persist GMS passwords in plaintext on non-Windows systems.
     def load():
-        if _FILE.exists():
-            try:
-                data = json.loads(_FILE.read_text(encoding="utf-8"))
-                return data.get("username", ""), data.get("password", "")
-            except Exception:
-                return "", ""
         return "", ""
 
     def save(username, password):
-        try:
-            _FILE.write_text(json.dumps({"username": username, "password": password}), encoding="utf-8")
-        except Exception:
-            pass
+        return None

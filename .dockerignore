@@ -1,0 +1,10 @@
+.git
+__pycache__
+jobs
+*.xls
+*.xlsx
+*.docx
+*.log
+.auth*
+.admin_hash
+首次登录密码.txt
