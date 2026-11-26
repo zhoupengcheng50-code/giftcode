@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import threading
 import time
+import storage
 
 ADMIN_USER = "admin-zpc"
 # 管理员初始密码的 PBKDF2-HMAC-SHA256 (200,000 次迭代) 加盐哈希，源码不留存明文密码
@@ -90,6 +91,9 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def _load_users() -> dict[str, dict]:
+    if storage.CLOUD:
+        raw = storage.get("users")
+        return json.loads(raw.decode("utf-8")) if raw else {}
     if not USERS_FILE.exists():
         return {}
     try:
@@ -102,6 +106,9 @@ def _load_users() -> dict[str, dict]:
 
 
 def _save_users(users: dict[str, dict]) -> None:
+    if storage.CLOUD:
+        storage.put("users", json.dumps(users, ensure_ascii=False).encode("utf-8"))
+        return
     tmp = USERS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(USERS_FILE)

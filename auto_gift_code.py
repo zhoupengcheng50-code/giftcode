@@ -13,6 +13,7 @@
 import copy
 import json
 import os
+import storage
 import os
 import re
 import time
@@ -441,6 +442,7 @@ class GiftCodeAutomator:
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
+        storage.save_job_file(path)
 
     # ==================== 执行操作（拷贝、改名、改奖励、发码、导出） ====================
 
@@ -696,6 +698,7 @@ class GiftCodeAutomator:
         temp_path = path.with_suffix(".tmp")
         book.save(str(temp_path))
         temp_path.replace(path)
+        storage.save_job_file(path)
 
         return records
 
@@ -764,6 +767,7 @@ class GiftCodeAutomator:
         self.set_progress(95, "合并导出", "正在生成最终多档位汇总表格...")
         name = self.job["activity_name"]
         final_file = write_xls(self.download_dir, name, results, self.code_count, self.expire_date_str)
+        storage.save_job_file(final_file)
 
         completed = self.download_dir / "completed.json"
         temporary = completed.with_suffix(".tmp")
@@ -780,6 +784,7 @@ class GiftCodeAutomator:
             encoding="utf-8",
         )
         temporary.replace(completed)
+        storage.save_job_file(completed)
 
         self.set_progress(100, "完成", "所有档位礼包码生成并导出完成！")
         self.log(f"🎉 全部 8 个档位礼包码自动化配置完成！汇总文件已保存至: {final_file}", "SUCCESS")

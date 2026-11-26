@@ -20,6 +20,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
+import storage
 
 from auth_manager import (
     add_user as auth_add_user,
@@ -42,10 +43,10 @@ CLOUD = os.environ.get("WORKBENCH_CLOUD") == "1"
 @asynccontextmanager
 async def lifespan(app):
     if CLOUD:
-        if not os.environ.get("WORKBENCH_DATA_DIR") or not os.environ.get("WORKBENCH_PUBLIC_HOST"):
-            raise RuntimeError("云端必须设置 WORKBENCH_DATA_DIR 和 WORKBENCH_PUBLIC_HOST")
-        if not os.path.ismount(DATA_DIR):
-            raise RuntimeError("WORKBENCH_DATA_DIR 必须是持久化磁盘挂载点；拒绝使用临时文件系统")
+        if not os.environ.get("WORKBENCH_PUBLIC_HOST") or not os.environ.get("DATABASE_URL"):
+            raise RuntimeError("云端必须设置 DATABASE_URL 和 WORKBENCH_PUBLIC_HOST")
+        storage.initialize()
+        storage.restore_jobs()
         if len(os.environ.get("WORKBENCH_SECRET", "")) < 32:
             raise RuntimeError("云端必须设置至少 32 字符的 WORKBENCH_SECRET")
     _admin_hash()
@@ -101,10 +102,15 @@ async def local_request(request: Request, call_next):
         if request.method in {"POST", "DELETE"}:
             actor = getattr(request.state, "user", {}).get("sub", "anonymous")
             try:
-                with (DATA_DIR / "audit.log").open("a", encoding="utf-8") as audit:
-                    audit.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "actor": actor, "method": request.method, "path": path, "status": response.status_code}, ensure_ascii=False) + "\n")
-            except OSError:
-                pass
+                event = {"time": datetime.now(timezone.utc).isoformat(), "actor": actor, "method": request.method, "path": path, "status": response.status_code}
+                if CLOUD:
+                    storage.audit(event)
+                else:
+                    with (DATA_DIR / "audit.log").open("a", encoding="utf-8") as audit:
+                        audit.write(json.dumps(event, ensure_ascii=False) + "\n")
+            except Exception:
+                import logging
+                logging.exception("审计日志写入失败")
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -404,6 +410,7 @@ def start_worker(mode, job, run_id):
                 "job": job["directory"].name, "count": job["count"], "expire_time": job["expire_time"],
             }), encoding="utf-8")
             temporary.replace(execution)
+            storage.save_job_file(execution)
         value = GiftCodeAutomator(job, WORK_DIR, log, progress, on_browser=on_browser).run(mode)
         with LOCK:
             if ACTIVE_RUN_ID != run_id:
@@ -412,6 +419,7 @@ def start_worker(mode, job, run_id):
                 temporary = manifest.with_suffix(".tmp")
                 temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
                 temporary.replace(manifest)
+                storage.save_job_file(manifest)
                 PREVIEW = {"token": uuid4().hex, "path": job["directory"], "value": value}
             else:
                 RESULT = Path(value)
