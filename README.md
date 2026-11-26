@@ -16,6 +16,10 @@
 
 Render 免费实例会休眠且不能挂载持久磁盘，免费 Render Postgres 30 天到期，不能用于该长期方案。Neon 免费套餐有容量、计算和恢复限制，见其当前条款；额度不足或服务停止可能影响登录、发码和数据恢复。请自行监控与备份，不保证永久免费或永久保存。
 
+## Supabase 备用方案
+
+如果 Neon 控制台无法使用，可以创建一个专用的 Supabase Free 项目，并关闭该项目的 Data API。到项目的 **Connect → Session pooler** 复制 PostgreSQL 连接字符串，将其中的密码占位符替换为实际数据库密码，填入 Render 的 `DATABASE_URL`。再从 Supabase 的 **Database Settings → SSL Configuration** 下载 CA 证书，在 Render 的 **Environment → Secret Files** 中保存为 `supabase-ca.crt`，并设置 `WORKBENCH_DB_CA_FILE=/etc/secrets/supabase-ca.crt`。其他 Render 环境变量沿用上述配置。Supabase 免费项目在一周内活动不足时可能暂停，需要到控制台恢复。
+
 ## 安全和操作
 Render URL 仍可能被公网访问，工作台登录只控制认证，不等于网络隔离；上线前应增加零信任入口、限流和审计，并阻止绕过入口。普通用户具备完整业务操作权限，本人任务状态、预览和下载不会暴露给其他用户。管理员凭据、DATABASE_URL、SECRET 均只放 Render 环境变量，不可写入 GitHub。云端不保存 GMS 凭据；预览和生成时需要保持页面中的后台账号密码。
 

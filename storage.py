@@ -13,11 +13,13 @@ def connect():
     import certifi
     import psycopg
 
-    # The container does not ship with a per-user PostgreSQL root certificate.
+    root_cert = os.environ.get('WORKBENCH_DB_CA_FILE') or certifi.where()
+    if not Path(root_cert).is_file():
+        raise RuntimeError('找不到 PostgreSQL CA 证书，请检查 WORKBENCH_DB_CA_FILE')
     return psycopg.connect(
         DATABASE_URL,
         sslmode='verify-full',
-        sslrootcert=certifi.where(),
+        sslrootcert=root_cert,
         connect_timeout=15,
     )
 
