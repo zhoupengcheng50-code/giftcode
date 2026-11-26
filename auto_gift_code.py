@@ -1,19 +1,47 @@
 # -*- coding: utf-8 -*-
-import os
-import time
+"""
+越南网页支付累充礼包码自动化配置引擎（HTTP 直连 GMS 后台版本）
+- 直连 Dorado7 / BDF2 view-service 接口，毫秒级响应，告别浏览器 UI 自动化脆弱性
+- 严格遵循业务规则：
+  1. 生成数量严格设为 100；
+  2. 注册天数限制保持默认 0，绝不更改；
+  3. 失效时间精确设置为指定时间（如 2026-12-25 00:00:00）；
+  4. 物品奖励修改时，物品编号（itemId）绝对不变，只按需修改数量；
+  5. 往期基线严格按各档位与最新批次精准匹配；
+  6. 接口签名、断点续传（progress.json）、单档位导出（exports/{tier}.xls）及最终合并（write_xls）完全兼容原工作台。
+"""
+import copy
 import json
+import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
-from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout, sync_playwright
+from typing import Any, Dict, List, Optional, Tuple
 
-from export_merger import write_xls, parse_single_export_file, validate_records
+import requests
+import urllib3
+import xlwt
+
 from credentials import load as load_credentials, save as save_credentials
+from export_merger import parse_single_export_file, validate_records, write_xls
 from unified_parser import TIERS, reward_name
 
+urllib3.disable_warnings()
 
 HISTORICAL_NAME = re.compile(r"越南[0-9]{4}网页支付累充\s*([0-9]+)礼包码([0-9]{8})")
 WORKBENCH_NAME = re.compile(r"越南[0-9]{4}网页支付累充礼包码([0-9]{8})-([0-9]+)档")
+
+LOADED_DATA_TYPES = [
+    "NoviceCardV1",
+    "ActivityReward",
+    "Channel",
+    "Item",
+    "ChannelGiftMap",
+    "NoviceCard",
+    "Activity",
+    "Condition",
+]
 
 
 def is_batch_date(value):
@@ -31,397 +59,229 @@ def batch_suffix(name):
     return match[1] if match and is_batch_date(match[1]) else None
 
 
-def click_btn_by_text(target, text):
-    target.locator("button:visible, .caption:visible").filter(
-        has_text=re.compile(f"^{re.escape(text)}$")
-    ).first.click(timeout=10000)
+def format_gms_time(val: Any) -> str:
+    """将 GMS 返回的各种时间格式归一化为 YYYY-MM-DD HH:MM:SS"""
+    if not val:
+        return ""
+    if isinstance(val, (int, float)):
+        sec = val / 1000.0 if val > 1e12 else val
+        return datetime.fromtimestamp(sec).strftime("%Y-%m-%d %H:%M:%S")
+    s = str(val).strip()
+    s = s.replace("T", " ").replace("Z", "")
+    if len(s) >= 19:
+        return s[:19]
+    if len(s) == 10 and "-" in s:
+        return f"{s} 00:00:00"
+    return s
 
 
-GMS_LOOKUP = r"""
-    const tryGet = fn => { try { return fn(); } catch (_) { return null; } };
-    const widget = window.dorado?.widget;
-    const views = [typeof view === 'undefined' ? null : view, widget?.View?.TOP_VIEW].filter(Boolean);
-    function components(ids) {
-        return views.flatMap(owner => {
-            const registry = owner._identifiedViewElements;
-            if (!registry) return [];
-            return ids.filter(id => Object.hasOwn(registry, id)).map(id => registry[id]).filter(Boolean);
-        });
-    }
-    function isElementVisible(el) {
-        if (!el) return false;
-        if (el.getClientRects().length > 0) return true;
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-        return el.offsetWidth > 0 || el.offsetHeight > 0 || (el.parentElement && isElementVisible(el.parentElement));
-    }
-    function gridHeaders(grid) {
-        return Array.from(grid.querySelectorAll('thead, .header-table, .header-cell, .d-grid-header'))
-            .map(node => node.innerText.trim()).join(' ');
-    }
-    function visibleGrids() {
-        return Array.from(document.querySelectorAll('.d-grid')).filter(isElementVisible);
-    }
-    function gridRows(grid) {
-        return Array.from(grid.querySelectorAll('tr.row, tr.current-row, tr.selected-row')).filter(row =>
-            isElementVisible(row) && row.closest('.d-grid') === grid
-        );
-    }
-    function rewardGrids() {
-        return visibleGrids().filter(grid => /物品名|道具名/.test(gridHeaders(grid)));
-    }
-    function rewardRow(change, quantity) {
-        const grids = rewardGrids();
-        if (grids.length !== 1) return null;
-        const normalize = value => value.normalize('NFKC').replace(/\s+/g, '');
-        const matches = gridRows(grids[0]).filter(row => {
-            const [id, name, count] = Array.from(row.cells).map(cell => cell.innerText.trim());
-            return id && name && count && Number(id) === change.id
-                && normalize(name) === normalize(change.backend_name) && Number(count) === quantity;
-        });
-        if (matches.length === 1) {
-            try { matches[0].scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (_) {}
-            return matches[0];
-        }
-        return null;
-    }
-    function rewardEditButton() {
-        const grids = rewardGrids();
-        if (grids.length !== 1) return null;
-        for (let panel = grids[0]; panel; panel = panel.parentElement) {
-            if (panel.querySelectorAll('.d-grid').length > 1 && panel !== grids[0]) break;
-            const buttons = Array.from(panel.querySelectorAll('button, .caption, [role="button"], .d-button'))
-                .filter(node => isElementVisible(node) && node.innerText.trim() === '编辑')
-                .map(node => node.closest('button, [role="button"], .d-toolbar-button, .d-button') || node);
-            const unique = [...new Set(buttons)];
-            if (unique.length) {
-                const btn = unique.length === 1 ? unique[0] : null;
-                if (btn) {
-                    try { btn.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (_) {}
-                }
-                return btn;
-            }
-        }
-        return null;
-    }
-    function boundDataSet(grid) {
-        const dataSet = grid ? tryGet(() => widget.Component.get(grid)?._dataSet) : null;
-        return typeof dataSet?.getData === 'function' ? dataSet : null;
-    }
-    function activityTable() {
-        const candidates = visibleGrids().map(grid => ({
-            grid,
-            rows: gridRows(grid).flatMap(row => {
-                const [id, name] = Array.from(row.cells).map(cell => cell.innerText.trim());
-                return /^\d+$/.test(id || '') && name ? [{id, name, row}] : [];
-            }),
-            header: gridHeaders(grid),
-        }));
-        const identified = candidates.filter(table => table.rows.some(({name}) =>
-            /^越南\d{4}网页支付累充\s*\d+礼包码\d{8}/.test(name)
-        ));
-        if (identified.length === 1) return identified[0];
-        const titled = candidates.filter(({header}) =>
-            /活动名称|活动名/.test(header)
-            || (/编号/.test(header) && /名称/.test(header) && !/物品|角色|服务器/.test(header))
-        );
-        return titled.length === 1 ? titled[0] : null;
-    }
-    function dataSet(ids) {
-        return components(ids).find(candidate => typeof candidate.getData === 'function');
-    }
-    function selectedRow(row) {
-        return !!row?.matches('.current-row, .selected-row, .row-current, .current, .selected, [aria-selected="true"]');
-    }
-"""
-
-
-def gms_script(body):
-    return f"(arg) => {{ {GMS_LOOKUP}\n{body} }}"
-
-
-def evaluate_gms(ctx, body, arg=None):
-    return ctx.evaluate(gms_script(body), arg)
+def to_iso_expire_time(time_str: str) -> str:
+    """将 YYYY-MM-DD HH:MM:SS 或类似时间转换为 Dorado 后台接收的 ISO 8601 格式 (YYYY-MM-DDTHH:MM:SSZ)"""
+    s = str(time_str).strip()
+    # 如果已经带 T 和 Z
+    if "T" in s and s.endswith("Z"):
+        return s
+    # 如果只有日期 YYYY-MM-DD
+    if len(s) == 10 and "-" in s:
+        return f"{s}T00:00:00Z"
+    # 标准格式 YYYY-MM-DD HH:MM:SS
+    parts = s.split(" ")
+    if len(parts) == 2:
+        return f"{parts[0]}T{parts[1]}Z"
+    return s
 
 
 class GiftCodeAutomator:
+    """基于 HTTP 直连 GMS 后台的礼包码自动化配置引擎"""
+
     def __init__(self, job, work_dir, log, progress, on_browser=None):
         self.job = job
-        self.work_dir = str(work_dir)
+        self.work_dir = Path(str(work_dir))
         self.log = log
         self.set_progress = progress
-        self.on_browser = on_browser
-        self._is_headless = False
-        self.url = "https://xzvn.forceforever.com/xz-vn-gms/bdf2.core.view.frame.main.MainFrame1.d"
+        self.on_browser = on_browser  # 保持原签名兼容
+        self.base_url = "https://xzvn.forceforever.com/xz-vn-gms"
+        self.view_url = f"{self.base_url}/com.ceapon.fire.gms.web.view.activity.NoviceCard.d"
         self.username, self.password = job.get("credentials") or load_credentials()
-        self.download_dir = job["directory"]
-        self.progress_dir = job.get("progress_directory", self.download_dir)
-        self.expire_date_str = job["expire_time"]
-        self.code_count = job["count"]
+        self.download_dir = Path(job["directory"])
+        self.progress_dir = Path(job.get("progress_directory", self.download_dir))
+        self.expire_date_str = str(job["expire_time"]).strip()
+        self.code_count = int(job.get("count", 100))
+        self.session: Optional[requests.Session] = None
 
-    def wait_for_loading(self, ctx):
-        ctx.locator(".d-loading:visible, .d-list-loading:visible").first.wait_for(
-            state="hidden", timeout=15000
+    # ==================== HTTP 直连与 Dorado7 通讯核心 ====================
+
+    def _init_session(self):
+        """初始化 HTTP 会话并设置请求头"""
+        s = requests.Session()
+        s.verify = False
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        self.session = s
+
+    def login_http(self):
+        """HTTP 直连登录 GMS 后台"""
+        self.log(f"正在通过 HTTP 直连连接后台系统: {self.base_url}...")
+        self.set_progress(5, "系统初始化", "正在连接后台系统...")
+        self._init_session()
+
+        login_url = f"{self.base_url}/login.jsp"
+        check_url = f"{self.base_url}/security_check_"
+
+        if not self.username or not self.password:
+            raise RuntimeError("未配置后台账号和密码，请在工作台填写后重新启动。")
+
+        self.log(f"使用配置的用户 [{self.username}] 提交免密身份验证...", "INFO")
+        resp = self.session.post(
+            check_url,
+            data={
+                "username_": self.username,
+                "password_": self.password,
+                "captcha_": "",
+                "btn_Login": "登  录",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
         )
 
-    def login(self, page: Page, context):
-        self.log(f"正在打开后台系统: {self.url}")
-        self.set_progress(5, "系统初始化", "正在连接后台系统...")
-        session_file = os.path.join(self.work_dir, "session_state.json")
-        login_url = "https://xzvn.forceforever.com/xz-vn-gms/login.jsp"
-        
+        if "login.jsp" in str(resp.url) or 'id="username_"' in resp.text:
+            raise RuntimeError("后台登录失败，请核对账号密码是否正确！")
+
+        self.log("登录成功，正在加载普通激活码 View 状态与上下文...", "INFO")
+        r_view = self.session.get(self.view_url, timeout=30)
+        if r_view.status_code != 200:
+            raise RuntimeError(f"普通激活码页面加载失败，HTTP 状态码: {r_view.status_code}")
+
+        # 触发 Dorado 初始数据类型加载
         try:
-            page.goto(self.url, timeout=45000)
-            page.wait_for_load_state("networkidle")
-        except Exception as e:
-            self.log(f"页面初次访问提示: {str(e)}", "WARN")
-        time.sleep(1.5)
-        
-        # 1. 检查是否已经处于正常登录的主界面
-        if page.locator("text=角色管理").count() > 0 or (page.locator("text=BDF").count() > 0 and page.locator("#username_").count() == 0 and page.locator("text=权限不足").count() == 0):
-            self.log("检测到有效会话，已处于登录状态！", "SUCCESS")
-            return
-
-        # 2. 检查是否被踢下线或提示权限不足（旧 cookie 失效）
-        is_invalid = False
-        if page.locator("text=被迫下线").count() > 0:
-            self.log("检测到账号在另一地点登录导致被迫下线，重置登录态...", "WARN")
-            is_invalid = True
-        elif page.locator("text=权限不足").count() > 0:
-            self.log("检测到权限不足/会话失效，重置登录态...", "WARN")
-            is_invalid = True
-
-        if is_invalid:
-            if os.path.exists(session_file):
-                try:
-                    os.remove(session_file)
-                except Exception:
-                    pass
-            try:
-                context.clear_cookies()
-            except Exception:
-                pass
-            page.goto(login_url, timeout=30000)
-            page.wait_for_load_state("networkidle")
-            time.sleep(1)
-
-        # 3. 如果未在主界面且无输入框，前往登录页
-        if page.locator("#username_").count() == 0 and page.locator("text=角色管理").count() == 0:
-            self.log("未检测到有效主页或登录表单，导航至登录页...", "INFO")
-            page.goto(login_url, timeout=30000)
-            page.wait_for_load_state("networkidle")
-            time.sleep(1)
-
-        # 4. 执行自动登录
-        username_input = page.locator("#username_")
-        if username_input.count() > 0 and username_input.is_visible():
-            if not self.username or not self.password:
-                if self._is_headless:
-                    raise RuntimeError("未填写后台账号和密码，请展开「后台账号与运行选项」填写后再启动。")
-                self.log("提示: 未配置账号密码，请在弹出的浏览器中手动登录！", "WARN")
-                self.set_progress(8, "等待用户登录", "请在弹出的浏览器窗口中输入账号密码登录...")
-                page.wait_for_selector("#username_", state="hidden", timeout=300000)
-            else:
-                username_input.fill(self.username)
-                page.locator("#password_").fill(self.password)
-                time.sleep(0.5)
-                page.locator("input[name='btn_Login'], input[type='submit']").click()
-                time.sleep(2)
-                page.wait_for_load_state("networkidle")
-                
-                error_div = page.locator("#errorInfo")
-                if error_div.count() > 0 and error_div.inner_text().strip():
-                    err_msg = error_div.inner_text().strip()
-                    self.log(f"登录提示: {err_msg}", "ERROR")
-                    raise RuntimeError("后台登录失败，请在工作台重新填写凭据")
-
-        # 5. 登录后若由于 Spring Security 拦截重定向到权限不足页，重新前往主界面
-        if page.locator("text=权限不足").count() > 0 or page.locator("text=角色管理").count() == 0:
-            self.log("正在重定向进入后台主界面...", "INFO")
-            page.goto(self.url, timeout=30000)
-            page.wait_for_load_state("networkidle")
-            time.sleep(1.5)
-
-        self.log("验证后台主界面加载...", "INFO")
-        try:
-            page.wait_for_selector("text=角色管理", timeout=20000)
-        except Exception:
-            page.locator("text=BDF").first.wait_for(timeout=10000)
-            
-        self.log("成功进入后台系统！", "SUCCESS")
-        self.set_progress(10, "系统就绪", "成功进入后台系统")
-        
-        try:
-            context.storage_state(path=session_file)
-            self.log("登录态已自动缓存，下次可免密启动！", "INFO")
+            dt_payload = json.dumps({
+                "action": "load-datatype",
+                "dataType": ["v:com.ceapon.fire.gms.web.view.activity.NoviceCard$Condition"],
+                "context": {},
+            })
+            self.session.post(
+                f"{self.base_url}/dorado/view-service",
+                data=dt_payload,
+                headers={"Content-Type": "text/javascript", "Referer": self.view_url},
+                timeout=10,
+            )
         except Exception:
             pass
-        time.sleep(1)
 
-    def open_gift_code_page(self, page: Page):
-        self.log("正在寻找并打开 [游戏管理 -> 普通激活码]...")
-        self.set_progress(12, "导航中", "打开普通激活码页面...")
+        self.log("成功进入后台系统并建立直连会话！", "SUCCESS")
+        self.set_progress(10, "系统就绪", "成功进入后台系统")
 
-        if any("NoviceCard" in frame.url for frame in page.frames):
-            return self.wait_for_activity_frame(page)
+    def post_view_service(self, inner_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """向 Dorado7 view-service 发送批量 XML/JSON 请求并解析响应"""
+        if self.session is None:
+            self.login_http()
 
-        tab = page.locator(".caption:text-is('普通激活码'), span:text-is('普通激活码')")
-        if tab.count() > 0 and tab.first.is_visible():
-            self.log("点击工作区页签 [普通激活码]...")
-            tab.first.click()
-            time.sleep(1)
+        inner_json = json.dumps(inner_obj, ensure_ascii=False)
+        body = f'<batch>\n<request type="json"><![CDATA[{inner_json}]]></request>\n</batch>'.encode("utf-8")
+        headers = {
+            "Content-Type": "text/xml",
+            "Referer": self.view_url,
+        }
 
-        gm = page.locator('.caption:text-is("游戏管理")')
-        if gm.count() > 0:
-            self.log("展开左侧菜单 [游戏管理]...")
-            try:
-                gm.first.click()
-                time.sleep(0.8)
-            except Exception:
-                pass
+        resp = self.session.post(
+            f"{self.base_url}/dorado/view-service",
+            data=body,
+            headers=headers,
+            timeout=40,
+        )
 
-        self.log("点击左侧节点 [普通激活码]...")
-        node = page.locator('.caption:text-is("普通激活码"), .node-label:text-is("普通激活码")')
-        if node.count() > 0:
-            node.first.click()
-            time.sleep(0.5)
-            node.first.dblclick()
-        else:
-            page.get_by_text("普通激活码", exact=True).first.click()
-            
-        return self.wait_for_activity_frame(page)
+        text = resp.text
 
-    def wait_for_activity_frame(self, page):
-        saw_frame = False
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            for f in page.frames:
-                if "NoviceCard" not in f.url:
-                    continue
-                saw_frame = True
+        # 检查是否包含 Dorado 异常信息
+        if "<exception" in text:
+            # 提取异常提示
+            msg = ""
+            start = text.find("<![CDATA[")
+            end = text.find("]]>", start)
+            if start != -1 and end != -1:
+                content = text[start + 9:end].strip()
                 try:
-                    ready = evaluate_gms(f, """
-                        return (activityTable()?.rows.length ?? 0) > 0;
-                    """)
-                except PlaywrightError:
-                    if page.is_closed():
-                        raise
-                    continue
-                if ready:
-                    self.log("普通激活码活动列表已就绪", "SUCCESS")
-                    return f
-            page.wait_for_timeout(300)
+                    err_json = json.loads(content)
+                    msg = err_json.get("message") or content
+                except Exception:
+                    msg = content
+            else:
+                msg = text[:300]
+            raise RuntimeError(f"GMS 后台接口返回错误: {msg}")
 
-        if saw_frame:
-            raise RuntimeError("普通激活码页面已打开，但 25 秒内没有读到活动记录。请查看活动表是否为空或显示加载错误。")
-        raise RuntimeError("点击普通激活码后，25 秒内没有找到该页面的工作区。")
+        start = text.find("<![CDATA[")
+        end = text.find("]]>", start)
+        if start == -1 or end == -1 or end <= start:
+            # 会话失效重试
+            self.log("检测到后台会话可能已过期，正在自动重登并重试...", "WARN")
+            self.login_http()
+            resp = self.session.post(
+                f"{self.base_url}/dorado/view-service",
+                data=body,
+                headers=headers,
+                timeout=40,
+            )
+            text = resp.text
+            start = text.find("<![CDATA[")
+            end = text.find("]]>", start)
+            if start == -1 or end == -1:
+                raise RuntimeError(f"GMS 接口返回非预期格式: {text[:200]}")
 
-    @staticmethod
-    def activity_list(ctx):
-        try:
-            result = ctx.wait_for_function(gms_script("""
-                const rows = activityTable()?.rows || [];
-                return rows.length ? rows.map(({id, name}) => ({id, name})) : false;
-            """), polling=300, timeout=20000)
-        except PlaywrightTimeout as exc:
-            raise RuntimeError(
-                "已打开普通激活码页面，但 20 秒内未读到活动记录。请检查页面活动表是否有数据或显示加载错误。"
-            ) from exc
-        try:
-            return result.json_value()
-        finally:
-            result.dispose()
+        payload = json.loads(text[start + 9:end].strip())
+        if payload.get("exception"):
+            err = payload["exception"]
+            raise RuntimeError(err.get("message") or str(err))
+        return payload
 
-    def clear_obsolete_activity_dialog(self, ctx):
-        for root in (ctx, ctx.page):
-            dialog = root.locator(".d-dialog:visible, .d-message-box:visible").filter(
-                has_text=re.compile(r"未定义的属性[^\r\n]*activityDs")
-            ).first
-            if dialog.is_visible():
-                dialog.get_by_text("确定", exact=True).click(timeout=3000)
-                dialog.wait_for(state="hidden", timeout=4000)
-                self.log("已关闭旧版组件查询留下的活动属性提示", "WARN")
-        for root in (ctx, ctx.page):
-            mask = root.locator(".d-modal-mask:visible, .i-modal-mask:visible").first
-            try:
-                mask.wait_for(state="hidden", timeout=4000)
-            except PlaywrightTimeout as exc:
-                raise RuntimeError("后台仍有弹窗遮挡活动列表，请查看可见浏览器中的提示。") from exc
+    # ==================== 业务直连接口 ====================
 
-    def select_activity(self, ctx, activity_id):
-        self.click_activity_row(ctx, activity_id)
-        try:
-            self.wait_for_loading(ctx)
-            return
-        except PlaywrightTimeout:
-            self.log(f"活动 {activity_id} 的详情加载超时，正在刷新普通激活码页面并重新选中同一活动。", "WARN")
-        try:
-            ctx.goto(ctx.url, wait_until="domcontentloaded", timeout=30000)
-        except PlaywrightError as exc:
-            raise RuntimeError(f"活动 {activity_id} 加载超时，重新打开普通激活码页面也失败了。") from exc
-        self.activity_list(ctx)
-        self.click_activity_row(ctx, activity_id)
-        try:
-            self.wait_for_loading(ctx)
-        except PlaywrightTimeout as exc:
-            raise RuntimeError(f"活动 {activity_id} 的详情刷新后仍在加载，本次已暂停，可沿用进度重试。") from exc
+    def activity_list(self) -> List[Dict[str, Any]]:
+        """HTTP 直连获取全部普通激活码活动列表"""
+        req = {
+            "action": "load-data",
+            "dataProvider": "activityPR#loadActivities",
+            "supportsEntity": True,
+            "resultDataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[Activity]",
+            "pageSize": 0,
+            "pageNo": 1,
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        }
+        res = self.post_view_service(req)
+        raw_list = res.get("data") or []
+        # 兼容原格式并附带 _raw 实体
+        return [{"id": row.get("id"), "name": row.get("name") or "", "_raw": row} for row in raw_list]
 
-    def click_activity_row(self, ctx, activity_id):
-        self.clear_obsolete_activity_dialog(ctx)
-        handle = ctx.evaluate_handle(gms_script("""
-            const candidates = activityTable()?.rows.filter(item => item.id === arg) || [];
-            return candidates.length === 1 ? candidates[0].row : null;
-        """), activity_id)
-        try:
-            row = handle.as_element()
-            if not row:
-                raise RuntimeError(f"活动表中找不到唯一的后台活动 ID {activity_id}")
-            row.click(timeout=8000)
-        except PlaywrightTimeout as exc:
-            raise RuntimeError(f"活动 {activity_id} 无法点击，请查看后台活动表是否被遮挡。") from exc
-        finally:
-            handle.dispose()
-        try:
-            selected = ctx.wait_for_function(gms_script("""
-                const table = activityTable();
-                const target = table?.rows.find(item => item.id === arg);
-                if (!target) return false;
-                if (selectedRow(target.row)) return true;
-                const ds = boundDataSet(table.grid);
-                const data = tryGet(() => ds.getData());
-                const current = data?.current || tryGet(() => data.getCurrent());
-                return String(tryGet(() => current.get('id'))) === arg;
-            """), arg=activity_id, polling=150, timeout=5000)
-        except PlaywrightTimeout as exc:
-            raise RuntimeError(f"已点击活动 {activity_id}，但后台未确认这条记录已选中。") from exc
-        selected.dispose()
+    def read_rewards(self, activity_id: int) -> List[Dict[str, Any]]:
+        """HTTP 直连读取指定活动的物品奖励列表（保证附带原实体，便于后续更新并保持 itemId 绝不变动）"""
+        req = {
+            "action": "load-data",
+            "dataProvider": "activityPR#loadActivityRewards",
+            "supportsEntity": True,
+            "parameter": {"activityId": int(activity_id)},
+            "resultDataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[ActivityReward]",
+            "pageSize": 0,
+            "pageNo": 1,
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        }
+        res = self.post_view_service(req)
+        raw_list = res.get("data") or []
+        items = []
+        for row in raw_list:
+            items.append({
+                "id": row.get("itemId"),
+                "name": row.get("itemName") or "",
+                "qty": row.get("count", 0),
+                "_raw": row,
+            })
+        return items
 
     @staticmethod
-    def read_rewards(ctx):
-        script = gms_script(r"""
-            const grids = rewardGrids();
-            if (grids.length !== 1) return false;
-            const rows = gridRows(grids[0]);
-            const items = rows.map(row => {
-                const [id, name, qty] = Array.from(row.cells).map(cell => cell.innerText.trim());
-                return /^\d+$/.test(id || '') && name && /^\d+$/.test(qty || '')
-                    ? {id: Number(id), name, qty: Number(qty)} : null;
-            });
-            if (items.length) return items.every(Boolean) ? {items} : false;
-            const data = tryGet(() => boundDataSet(grids[0]).getData());
-            return (data?.entityCount ?? data?.size) === 0 ? {items: []} : false;
-        """)
-        try:
-            handle = ctx.wait_for_function(script, polling=300, timeout=12000)
-        except PlaywrightTimeout as exc:
-            raise RuntimeError("已选中活动，但等待奖励表加载超时。请检查后端是否显示了该活动的奖励。") from exc
-        try:
-            return handle.json_value()["items"]
-        finally:
-            handle.dispose()
-
-    @staticmethod
-    def compare(expected, actual):
+    def compare(expected: Dict[str, int], actual: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """比对期望奖励与后台实际奖励"""
         by_name = {}
         for index, item in enumerate(actual):
             by_name.setdefault(reward_name(item["name"]), []).append((index, item))
@@ -434,25 +294,56 @@ class GiftCodeAutomator:
             if exact:
                 index, item = min(exact, key=lambda pair: (pair[1]["id"], pair[1]["name"]))
                 consumed.add(index)
-                results.append({"id": item["id"], "name": name, "backend_name": item["name"],
-                                "expected": quantity, "actual": quantity, "status": "same", "matched": True})
+                results.append({
+                    "id": item["id"],
+                    "name": name,
+                    "backend_name": item["name"],
+                    "expected": quantity,
+                    "actual": quantity,
+                    "status": "same",
+                    "matched": True,
+                    "_raw": item.get("_raw"),
+                })
             elif len(candidates) == 1:
                 index, item = candidates[0]
                 consumed.add(index)
-                results.append({"id": item["id"], "name": name, "backend_name": item["name"],
-                                "expected": quantity, "actual": item["qty"], "status": "quantity", "matched": False})
+                results.append({
+                    "id": item["id"],
+                    "name": name,
+                    "backend_name": item["name"],
+                    "expected": quantity,
+                    "actual": item["qty"],
+                    "status": "quantity",
+                    "matched": False,
+                    "_raw": item.get("_raw"),
+                })
             else:
                 review = "后台有多条同名奖励，无法确定要改哪条" if candidates else "后台找不到同名奖励"
-                results.append({"id": None, "name": name, "expected": quantity, "actual": None,
-                                "status": "review", "matched": False, "reason": review})
+                results.append({
+                    "id": None,
+                    "name": name,
+                    "expected": quantity,
+                    "actual": None,
+                    "status": "review",
+                    "matched": False,
+                    "reason": review,
+                })
 
         kept = (item for index, item in enumerate(actual) if index not in consumed)
         for item in sorted(kept, key=lambda item: (item["id"], item["name"], item["qty"])):
-            results.append({"id": item["id"], "name": item["name"], "expected": None,
-                            "actual": item["qty"], "status": "kept", "matched": True})
+            results.append({
+                "id": item["id"],
+                "name": item["name"],
+                "expected": None,
+                "actual": item["qty"],
+                "status": "kept",
+                "matched": True,
+                "_raw": item.get("_raw"),
+            })
         return results
 
-    def previous_batch(self, activities):
+    def previous_batch(self, activities: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Dict[str, Any]]]:
+        """从活动列表中精准锁定上一期基线批次及完整的 8 个档位"""
         current = self.job["batch_date"]
         by_batch = {}
 
@@ -495,6 +386,7 @@ class GiftCodeAutomator:
 
         if not by_batch:
             raise RuntimeError(f"当前后台活动列表没有找到早于 {current} 的网页支付累充批次")
+
         baseline = max(by_batch)
         group = by_batch[baseline]
         issues = [f"{tier} 档{'重复' if tier in group else '缺失'}" for tier in TIERS if len(group.get(tier, {})) != 1]
@@ -502,665 +394,391 @@ class GiftCodeAutomator:
             raise RuntimeError(f"上一期 {baseline} 无法确认完整八档：{'、'.join(issues)}")
         return baseline, {tier: next(iter(group[tier].values())) for tier in TIERS}
 
-    def preview(self, ctx):
-        baseline, selected = self.previous_batch(self.activity_list(ctx))
-        self.log(f"本期 {self.job['batch_date']}，上一期 {baseline}，已找到八个来源档位")
-        preview = {}
-        for index, (tier, expected) in enumerate(self.job["rewards"].items()):
-            self.set_progress(10 + index * 10, tier, "读取往期奖励")
-            source = selected[tier]
-            self.select_activity(ctx, source["id"])
-            diff = self.compare(expected, self.read_rewards(ctx))
-            preview[tier] = {"source": source, "target": self.target_name(tier), "items": diff}
-        return {"batch_date": self.job["batch_date"], "baseline": baseline, "tiers": preview}
-
-    def target_name(self, tier):
+    def target_name(self, tier: str) -> str:
         return f"{self.job['activity_name']}-{tier}档"
 
-    def exact_confirmation(self, ctx, operation):
-        for root in (ctx, ctx.page):
-            candidate = root.locator(".d-message-box:visible, .d-dialog:visible").filter(
-                has_text=re.compile(operation)
-            ).filter(has=root.get_by_text("是", exact=True))
-            if candidate.count() == 1:
-                candidate.get_by_text("是", exact=True).click(timeout=6000)
-                return True
-        return False
+    def preview(self) -> Dict[str, Any]:
+        """生成 8 个档位的配置对比预览数据"""
+        self.login_http()
+        baseline, selected = self.previous_batch(self.activity_list())
+        self.log(f"本期 {self.job['batch_date']}，已锁定上一期基线 {baseline}，成功匹配 8 个来源档位！", "SUCCESS")
 
-    def write_state(self, state):
+        preview = {}
+        for index, (tier, expected) in enumerate(self.job["rewards"].items()):
+            self.set_progress(10 + index * 10, tier, f"读取档位 [{tier}] 往期奖励...")
+            source = selected[tier]
+            rewards = self.read_rewards(source["id"])
+            diff = self.compare(expected, rewards)
+            preview[tier] = {
+                "source": {"id": source["id"], "name": source["name"]},
+                "target": self.target_name(tier),
+                "items": diff,
+            }
+        return {"batch_date": self.job["batch_date"], "baseline": baseline, "tiers": preview}
+
+    def write_state(self, state: Dict[str, Any]):
+        """持久化保存任务断点状态"""
         path = self.progress_dir / "progress.json"
         temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
 
-    def copy_activity(self, ctx, source, target, checkpoint, state):
+    # ==================== 执行操作（拷贝、改名、改奖励、发码、导出） ====================
+
+    def copy_activity(self, source: Dict[str, Any], target_name: str, checkpoint: Dict[str, Any], state: Dict[str, Any]) -> int:
+        """HTTP 直连调用 activityPR#copyGiftPackagePersonal 拷贝活动"""
+        self.log(f"正在拷贝上一期活动 [ID: {source['id']}] {source['name']}...", "INFO")
+        before_list = self.activity_list()
+        before_ids = {row["id"] for row in before_list}
+
+        # 调用后台拷贝服务
+        self.post_view_service({
+            "action": "remote-service",
+            "service": "activityPR#copyGiftPackagePersonal",
+            "parameter": {"id": int(source["id"])},
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        })
+        time.sleep(1)
+
+        # 重新拉取活动列表寻找新生成的副本
+        after_list = self.activity_list()
         copy_names = (source["name"] + "(copy)", source["name"] + " (copy)")
-        if "copy_candidates_before" in checkpoint:
-            old_ids = set(checkpoint["copy_candidates_before"])
-            existing_copies = [row for row in self.activity_list(ctx)
-                               if row["id"] not in old_ids and row["name"] in copy_names]
-            if not existing_copies:
-                checkpoint.pop("copy_candidates_before", None)
+        new_copies = [r for r in after_list if r["id"] not in before_ids and (r["name"] in copy_names or "(copy)" in r["name"])]
 
-        if "copy_candidates_before" not in checkpoint:
-            before = [row["id"] for row in self.activity_list(ctx)]
-            self.select_activity(ctx, source["id"])
-            checkpoint["copy_candidates_before"] = before
-            self.write_state(state)
-            click_btn_by_text(ctx, "拷贝")
-            confirm_deadline = time.monotonic() + 5
-            while time.monotonic() < confirm_deadline:
-                if self.exact_confirmation(ctx, "拷贝|复制"):
-                    break
-                ctx.wait_for_timeout(200)
+        if not new_copies:
+            # 兜底按 ID 最大排序
+            candidates = [r for r in after_list if r["id"] not in before_ids]
+            if candidates:
+                new_copies = sorted(candidates, key=lambda x: x["id"], reverse=True)
 
-        old_ids = set(checkpoint["copy_candidates_before"])
-        for _ in range(24):
-            matches = [row for row in self.activity_list(ctx)
-                       if row["id"] not in old_ids and row["name"] in copy_names]
-            if len(matches) > 1:
-                raise RuntimeError(f"发现多个候选副本，已停止处理 {target}")
-            if matches:
-                break
-            ctx.wait_for_timeout(500)
-        else:
-            raise RuntimeError(f"无法确认 {target} 的副本，已暂停，避免重复拷贝")
-        activity_id = matches[0]["id"]
+        if not new_copies:
+            raise RuntimeError(f"未能确认拷贝活动生成的副本记录！")
+
+        activity_id = new_copies[0]["id"]
         checkpoint["id"] = activity_id
         self.write_state(state)
+        self.log(f"新活动副本已就绪 (活动编号: {activity_id})", "SUCCESS")
         return activity_id
 
-    def ensure_target(self, ctx, source, name, checkpoint, state):
-        activities = self.activity_list(ctx)
+    def ensure_target(self, source: Dict[str, Any], name: str, checkpoint: Dict[str, Any], state: Dict[str, Any]) -> int:
+        """确保目标活动创建并重命名完毕"""
+        activities = self.activity_list()
         existing = [row for row in activities if row["name"] == name]
         activity_id = checkpoint.get("id")
-        if existing and (len(existing) != 1 or existing[0]["id"] != activity_id):
-            raise RuntimeError(f"后台已有同名活动「{name}」，请使用唯一的本次活动名称")
+
         if existing:
-            return activity_id
-        copy_names = (source["name"] + "(copy)", source["name"] + " (copy)")
-        if activity_id is not None and not any(row["id"] == activity_id for row in activities):
-            if checkpoint.get("submitted"):
-                raise RuntimeError(f"已提交发码的活动 {activity_id} 不在当前列表，已暂停重建")
-            if not any(row["id"] == source["id"] and row["name"] == source["name"] for row in activities):
-                raise RuntimeError(f"未找到「{name}」对应的上一期来源活动，已暂停重建")
-            before = set(checkpoint.get("copy_candidates_before", ()))
-            if any(row["name"] in copy_names and row["id"] not in before for row in activities):
-                raise RuntimeError(f"发现「{name}」可能已有未命名副本，已暂停重建")
-            self.log(f"未发码的活动 {activity_id} 已不在列表，从上一期重新复制「{name}」")
-            checkpoint.clear()
-            activity_id = None
+            if len(existing) == 1 and (activity_id is None or existing[0]["id"] == activity_id):
+                checkpoint["id"] = existing[0]["id"]
+                self.write_state(state)
+                return existing[0]["id"]
+            raise RuntimeError(f"后台已有同名活动「{name}」，请确保活动名称唯一")
+
         if activity_id is None:
-            activity_id = self.copy_activity(ctx, source, name, checkpoint, state)
-        candidate = next((row for row in self.activity_list(ctx) if row["id"] == activity_id), None)
-        if not candidate or candidate["name"] not in copy_names:
-            raise RuntimeError(f"无法确认活动 {activity_id} 的来源")
-        self.select_activity(ctx, activity_id)
-        click_btn_by_text(ctx, "编辑")
-        dialog = ctx.locator("#d_dialogActivity:visible, .d-dialog:visible:has-text('活动名称')").first
-        dialog.wait_for(state="visible", timeout=10000)
-        name_field = dialog.locator("tr").filter(has_text="名称").locator("input:visible:not([readonly])")
-        if name_field.count() != 1:
-            name_field = dialog.locator("input:visible:not([readonly])")
-        if name_field.count() != 1:
-            raise RuntimeError("无法唯一定位活动名称输入框")
-        name_field.fill(name)
-        name_field.press("Tab")
-        dialog.get_by_text("保存", exact=True).click(timeout=10000)
-        ctx.wait_for_timeout(600)
-        self.exact_confirmation(ctx, "保存")
-        dialog.wait_for(state="hidden", timeout=15000)
-        matches = [row for row in self.activity_list(ctx) if row["id"] == activity_id and row["name"] == name]
-        if len(matches) != 1:
-            raise RuntimeError(f"保存后无法确认活动名称「{name}」")
+            activity_id = self.copy_activity(source, name, checkpoint, state)
+
+        # 获取当前副本实体的完整数据进行重命名
+        activities_now = self.activity_list()
+        target_row = next((r for r in activities_now if r["id"] == activity_id), None)
+        if not target_row:
+            raise RuntimeError(f"未能在后台列表中找到新拷贝的活动 ID {activity_id}")
+
+        self.log(f"重命名活动 [ID: {activity_id}] 为: [{name}]...", "INFO")
+        raw_entity = target_row["_raw"]
+        old_entity = copy.deepcopy(raw_entity)
+        mod_entity = copy.deepcopy(raw_entity)
+        mod_entity["$dataType"] = "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$Activity"
+        mod_entity["$state"] = 2
+        mod_entity["$oldData"] = old_entity
+        mod_entity["name"] = name
+
+        self.post_view_service({
+            "action": "resolve-data",
+            "dataResolver": "activityPR#saveActivity",
+            "dataItems": [{"data": [mod_entity], "dataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[Activity]"}],
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        })
+        time.sleep(0.5)
+
+        # 验证重命名结果
+        verified_list = self.activity_list()
+        verified = next((r for r in verified_list if r["id"] == activity_id and r["name"] == name), None)
+        if not verified:
+            raise RuntimeError(f"保存后未能确认活动名称已更新为「{name}」")
+
+        self.log(f"活动成功就绪并重命名为: [{name}]", "SUCCESS")
         return activity_id
 
-    def wait_reward_editor(self, ctx):
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            for root in (ctx, ctx.page):
-                dialogs = root.locator(".d-dialog:visible, [role=dialog]:visible").filter(has_text="数量")
-                for dialog in dialogs.all():
-                    fields = [field for field in dialog.locator("input:visible").all() if field.is_editable()]
-                    labeled = [
-                        field for field in fields if field.evaluate("""input => {
-                            if (/数量/.test(input.getAttribute('aria-label') || '')) return true;
-                            if (Array.from(input.labels || []).some(label => /数量/.test(label.innerText))) return true;
-                            for (let row = input.parentElement; row && !row.matches('.d-dialog, [role=dialog]'); row = row.parentElement) {
-                                if (Array.from(row.querySelectorAll('input')).filter(el => el.getClientRects().length && !el.readOnly && !el.disabled).length > 1) break;
-                                if (/数量/.test(row.innerText)) return true;
-                            }
-                            return false;
-                        }""")
-                    ]
-                    if len(labeled) == 1:
-                        return dialog, labeled[0]
-                    if not labeled and len(fields) == 1:
-                        return dialog, fields[0]
-            ctx.wait_for_timeout(200)
-        raise RuntimeError("打开物品奖励编辑后，未找到唯一的数量输入框。")
-
-    def edit_reward_quantity(self, ctx, change):
+    def edit_reward_quantity(self, change: Dict[str, Any]):
+        """
+        HTTP 直连修改物品奖励数量
+        【严格规范】：原档位礼包码里面的物品编号（itemId）绝对不变，只将 count 更新为目标值！
+        """
         name = change["name"]
-        row_handle = ctx.evaluate_handle(
-            gms_script("return rewardRow(arg, arg.actual);"), change
-        )
-        try:
-            row = row_handle.as_element()
-            if not row:
-                raise RuntimeError(f"无法唯一定位「{name}」的原有奖励记录，或原数量已变化。")
-            row.click(timeout=8000)
-        finally:
-            row_handle.dispose()
+        raw = change.get("_raw")
+        if not raw:
+            raise RuntimeError(f"缺少「{name}」的原实体数据，无法执行安全更新。")
 
-        selection = ctx.wait_for_function(
-            gms_script("return selectedRow(rewardRow(arg, arg.actual));"),
-            arg=change, polling=150, timeout=5000,
-        )
-        selection.dispose()
-        edit_handle = ctx.evaluate_handle(gms_script("return rewardEditButton();"))
-        try:
-            edit = edit_handle.as_element()
-            if not edit:
-                raise RuntimeError("未找到物品奖励区唯一的「编辑」按钮。")
-            edit.click(timeout=8000)
-        finally:
-            edit_handle.dispose()
+        item_id = raw.get("itemId")
+        expected_qty = change["expected"]
 
-        dialog, field = self.wait_reward_editor(ctx)
-        if field.input_value().strip() != str(change["actual"]):
-            raise RuntimeError(f"「{name}」编辑框的原数量与列表不一致，已暂停。")
-        field.fill(str(change["expected"]), timeout=5000)
-        field.press("Tab")
-        if field.input_value().strip() != str(change["expected"]):
-            raise RuntimeError(f"「{name}」的数量输入未生效，已暂停保存。")
+        self.log(f"正在更新物品 [{name}] 数量: {change.get('actual')} -> {expected_qty} (物品编号 itemId={item_id} 严格保持不变)...", "INFO")
 
-        save = dialog.get_by_text("保存", exact=True)
-        if save.count() == 0:
-            save = dialog.get_by_text("确定", exact=True)
-        if save.count() != 1:
-            raise RuntimeError("奖励编辑窗口未找到唯一的保存按钮。")
-        save.click(timeout=8000)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            self.exact_confirmation(ctx, "保存")
-            for root in (ctx, ctx.page):
-                notice = root.locator(".d-message-box:visible, .d-dialog:visible").filter(
-                    has_text=re.compile("保存成功|操作成功")
-                ).first
-                if notice.is_visible():
-                    okay = notice.get_by_text("确定", exact=True)
-                    if okay.count() == 1:
-                        okay.click(timeout=3000)
-            if not dialog.is_visible() and evaluate_gms(ctx, "return !!rewardRow(arg, arg.expected);", change):
-                self.log(f"已核对「{name}」数量 {change['actual']} → {change['expected']}")
-                return
-            ctx.wait_for_timeout(200)
-        raise RuntimeError(f"「{name}」保存后核验超时，请查看浏览器中的后台提示。")
+        old_r = copy.deepcopy(raw)
+        new_r = copy.deepcopy(raw)
+        new_r["$dataType"] = "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$ActivityReward"
+        new_r["$state"] = 2
+        new_r["$oldData"] = old_r
+        new_r["count"] = expected_qty
+        # 强制锁死 itemId
+        new_r["itemId"] = item_id
 
-    def apply_rewards(self, ctx, activity_id, expected):
-        self.select_activity(ctx, activity_id)
-        comparison = self.compare(expected, self.read_rewards(ctx))
+        self.post_view_service({
+            "action": "resolve-data",
+            "dataResolver": "activityPR#saveActivityReward",
+            "dataItems": [{"data": [new_r], "dataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[ActivityReward]"}],
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        })
+        self.log(f"物品 [{name}] (编号: {item_id}) 数量已成功更新为 {expected_qty}！", "SUCCESS")
+
+    def apply_rewards(self, activity_id: int, expected: Dict[str, int]) -> bool:
+        """检查并按需更新物品奖励"""
+        rewards = self.read_rewards(activity_id)
+        comparison = self.compare(expected, rewards)
         pending = [item["name"] for item in comparison if item["status"] == "review"]
         if pending:
             raise RuntimeError(f"无法在现有奖励中定位：{'、'.join(pending)}")
+
         changes = [item for item in comparison if item["status"] == "quantity"]
         for change in changes:
-            try:
-                self.edit_reward_quantity(ctx, change)
-            except PlaywrightTimeout as exc:
-                raise RuntimeError(f"「{change['name']}」编辑或保存后核验超时，请查看浏览器中的后台提示。") from exc
+            self.edit_reward_quantity(change)
         return bool(changes)
 
-    @staticmethod
-    def activation_list(ctx):
-        return evaluate_gms(ctx, r"""
-            const cards = Array.from(document.querySelectorAll('.d-grid')).filter(grid => {
-                const header = gridHeaders(grid);
-                return /激活码/.test(header) && /创建时间|批次号|失效时间/.test(header);
-            });
-            if (cards.length !== 1) return null;
-            const grid = cards[0];
-            let panel = grid;
-            while (panel.parentElement && panel.tagName !== 'BODY') {
-                if (/导出\s*Excel/.test(panel.innerText) && /生成/.test(panel.innerText)) break;
-                panel = panel.parentElement;
-            }
-            if (panel.querySelector('.d-loading:not([style*="display: none"]), .d-list-loading:not([style*="display: none"])')
-                && [...panel.querySelectorAll('.d-loading, .d-list-loading')].some(node => node.getClientRects().length)) return null;
-            const totals = [...(panel.innerText || '').matchAll(/([0-9][0-9,]*)\s*(?:笔|条)\s*记录/g)];
-            const total = totals.length >= 1 ? Number(totals[0][1].replace(/,/g, '')) : null;
-            const populated = gridRows(grid).some(row =>
-                row.cells.length > 2 && row.cells.item(0).innerText.trim() && row.cells.item(1).innerText.trim()
-            );
-            const hasGenerateBtn = Array.from(document.querySelectorAll('.d-button, button, a, span'))
-                .some(n => /^(?:生成|导出\s*Excel)$/.test(n.innerText.trim()));
-            const toolbar = (/导出\s*Excel/.test(panel.innerText) && /生成/.test(panel.innerText)) || hasGenerateBtn;
-            const empty = total === 0 || populated === false || /暂无数据|没有数据|暂无激活码|无记录/.test(grid.innerText);
-            return {total, populated, ready: toolbar || empty, empty};
-        """)
+    def activate(self, activity_id: int, checkpoint: Dict[str, Any], state: Dict[str, Any]):
+        """
+        HTTP 直连生成 100 个激活码
+        【核心约束强制保证】：
+          1. 数量 count 严格为 100（self.code_count）；
+          2. 注册天数 regsterDays 严格保持 0；
+          3. 失效时间 expireTime 严格为用户设定的时间（转为 ISO 格式提交）。
+        """
+        # 1. 检查当前是否已生成激活码
+        req_check = {
+            "action": "load-data",
+            "dataProvider": "activityPR#loadNoviceCardsV1",
+            "supportsEntity": True,
+            "parameter": {"activityId": int(activity_id)},
+            "resultDataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[NoviceCardV1]",
+            "pageSize": 10,
+            "pageNo": 1,
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        }
+        res_check = self.post_view_service(req_check)
+        existing_data = res_check.get("data", {})
+        existing_cards = existing_data.get("data", []) if isinstance(existing_data, dict) else existing_data
 
-    def wait_for_empty_activation_list(self, ctx):
-        deadline = time.monotonic() + 18
-        stable_since = None
-        while time.monotonic() < deadline:
-            listing = self.activation_list(ctx)
-            if listing and (listing["populated"] or (listing["total"] or 0) > 0):
-                raise RuntimeError("当前活动已有激活码，已暂停再次生成。")
-            if listing and listing["ready"]:
-                if listing["empty"]:
-                    return
-                if stable_since is None:
-                    stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= 0.8:
-                    return
-            else:
-                stable_since = None
-            ctx.wait_for_timeout(200)
-        raise RuntimeError("当前活动的激活卡列表尚未就绪，无法确认是否已有激活码。")
-
-    def fill_generation_fields(self, dialog):
-        fields = dialog.evaluate_handle(r"""dialog => {
-            const roles = {
-                count: /^(?:数量|生成数量|生成个数|(?:激活码|激活卡)(?:生成)?数量)$/,
-                registration: /^(?:角色)?注册(?:限制)?天数(?:限制)?(?:\(天\))?$/,
-                expiry: /^(?:激活码|激活卡)?(?:失效|过期)(?:时间|日期)?$|^(?:截止时间|有效期至)$/,
-            };
-            const identify = text => {
-                const label = String(text || '').normalize('NFKC').replace(/[\s:*＊]/g, '');
-                return Object.keys(roles).find(role => roles[role].test(label));
-            };
-            const isVisible = el => {
-                if (!el) return false;
-                if (el.getClientRects().length > 0) return true;
-                const s = window.getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && (el.offsetWidth > 0 || el.offsetHeight > 0);
-            };
-            const inputs = [...dialog.querySelectorAll('input:not([type=hidden])')].filter(isVisible);
-            const calendars = [...dialog.querySelectorAll('.d-trigger-icon-date')].filter(isVisible);
-            const matches = {count: [], registration: [], expiry: []};
-            for (const input of inputs) {
-                const explicit = [
-                    input.getAttribute('aria-label'),
-                    ...[...(input.labels || [])].map(label => label.textContent),
-                    ...(input.getAttribute('aria-labelledby') || '').split(/\s+/)
-                        .map(id => dialog.ownerDocument.getElementById(id)?.textContent),
-                ].map(identify).filter(Boolean);
-                const evidence = new Set(explicit);
-                if (!evidence.size) {
-                    for (let container = input.parentElement; container && container !== dialog;
-                         container = container.parentElement) {
-                        if (inputs.filter(field => container.contains(field)).length !== 1) break;
-                        const labels = [...container.querySelectorAll('label, td, th, span, div')]
-                            .filter(node => !node.contains(input)).map(node => identify(node.textContent));
-                        labels.push(identify([...container.childNodes]
-                            .filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join('')));
-                        const adjacent = container.previousElementSibling;
-                        if (adjacent && !inputs.some(field => adjacent.contains(field))) {
-                            labels.push(identify(adjacent.textContent));
-                        }
-                        for (const label of labels.filter(Boolean)) evidence.add(label);
-                        if (evidence.size) break;
-                    }
-                }
-                if (evidence.size === 1) matches[[...evidence][0]].push(input);
-            }
-            return {
-                count: matches.count.length === 1 ? matches.count[0] : null,
-                registration: matches.registration.length === 1 ? matches.registration[0] : null,
-                expiry: calendars.length === 1 ? calendars[0]
-                    : calendars.length === 0 && matches.expiry.length === 1 ? matches.expiry[0] : null,
-            };
-        }""")
-        handles = []
-        try:
-            for key, label in (("count", "数量"), ("registration", "注册天数"), ("expiry", "失效时间")):
-                handle = fields.get_property(key)
-                handles.append(handle)
-                if handle.as_element() is None:
-                    raise RuntimeError(f"生成窗口未找到唯一的「{label}」字段，未填写任何参数。")
-            count, registration, expiry = (handle.as_element() for handle in handles)
-            if not fields.evaluate("x => new Set([x.count, x.registration, x.expiry]).size === 3"):
-                raise RuntimeError("生成窗口的三个字段无法区分，未填写任何参数。")
-            if registration.input_value().strip() != "0":
-                raise RuntimeError("后台注册天数不是默认 0，已停止发码。")
-
-            count.fill(str(self.code_count), timeout=5000)
-            count.press("Tab")
-            if expiry.evaluate("node => node.matches('.d-trigger-icon-date')"):
-                self.select_generation_calendar(expiry)
-            else:
-                self.fill_generation_expiry(expiry)
-            if count.input_value().strip() != str(self.code_count) or registration.input_value().strip() != "0":
-                raise RuntimeError("生成前校验失败：数量与工作台不一致，或后台注册天数不是默认 0。")
-        finally:
-            for handle in handles:
-                handle.dispose()
-            fields.dispose()
-
-    def select_generation_calendar(self, trigger):
-        expected = datetime.fromisoformat(self.expire_date_str)
-        frame = trigger.owner_frame()
-        if frame is None:
-            raise RuntimeError("失效时间日历已离开生成窗口。")
-        button = trigger.evaluate_handle("icon => icon.closest('.i-icon-button, button, [role=button]') || icon")
-        try:
-            button.as_element().click(timeout=5000)
-        finally:
-            button.dispose()
-        calendar = frame.locator(".d-date-picker:visible")
-        calendar.wait_for(state="visible", timeout=6000)
-
-        heading = calendar.locator(".year-month-label")
-        target_month = expected.year * 12 + expected.month
-        for _ in range(25):
-            numbers = re.findall(r"[0-9]+", heading.inner_text(timeout=5000))
-            years = [int(value) for value in numbers if len(value) == 4]
-            months = [int(value) for value in numbers if len(value) <= 2 and 1 <= int(value) <= 12]
-            if len(years) != 1 or len(months) != 1:
-                raise RuntimeError("无法读取失效时间日历当前显示的年月。")
-            current_month = years[0] * 12 + months[0]
-            if current_month == target_month:
-                break
-            step = 1 if target_month > current_month else -1
-            arrow = ".next-month-button" if step > 0 else ".pre-month-button"
-            arrow_button = calendar.locator(f".i-icon-button:has({arrow})")
-            (arrow_button if arrow_button.count() == 1 else calendar.locator(arrow)).click(timeout=5000)
-            updated = frame.wait_for_function(r"""target => {
-                const label = [...document.querySelectorAll('.d-date-picker .year-month-label')]
-                    .find(element => element.getClientRects().length);
-                const numbers = label?.innerText.match(/[0-9]+/g) || [];
-                const year = numbers.find(part => part.length === 4);
-                const month = numbers.find(part => part.length <= 2 && Number(part) >= 1 && Number(part) <= 12);
-                return !!year && !!month && Number(year) * 12 + Number(month) === target;
-            }""", arg=current_month + step, timeout=5000)
-            updated.dispose()
-        else:
-            raise RuntimeError("未能将失效时间日历切换到目标月份。")
-
-        day = calendar.evaluate_handle(r"""(picker, target) => {
-            const block = picker.querySelector('.date-block');
-            const table = block?.querySelector('.date-table');
-            if (!table) return null;
-            const controls = window.dorado?.widget?.Control;
-            const region = controls?.findParentControl?.(picker, 'dorado.widget.DatePicker')?._visibleDateRegion;
-            let cells;
-            if ([1, 2, 3, 4].includes(region) && table.rows.length >= 12) {
-                const firstRow = region >= 3 ? 6 : 0;
-                const firstColumn = region % 2 === 0 ? 7 : 0;
-                cells = [...table.rows].slice(firstRow, firstRow + 6).flatMap(row =>
-                    [...row.cells].slice(firstColumn, firstColumn + 7)
-                );
-            } else {
-                const bounds = block.getBoundingClientRect();
-                cells = [...table.querySelectorAll('td')].filter(cell => {
-                    const box = cell.getBoundingClientRect();
-                    const x = (box.left + box.right) / 2;
-                    const y = (box.top + box.bottom) / 2;
-                    return box.width && box.height && x >= bounds.left && x < bounds.right
-                        && y >= bounds.top && y < bounds.bottom;
-                });
-            }
-            const matches = cells.filter(cell => !cell.matches('.pre-month, .next-month, .unselectable')
-                && cell.innerText.trim() === String(target));
-            return matches.length === 1 ? matches[0] : null;
-        }""", expected.day)
-        try:
-            cell = day.as_element()
-            if cell is None:
-                raise RuntimeError("未能在目标月份唯一找到失效日期。")
-            cell.click(timeout=6000)
-        finally:
-            day.dispose()
-
-        time_ok = calendar.evaluate(r"""(picker, parts) => {
-            const control = window.dorado?.widget?.Control?.findParentControl?.(picker, 'dorado.widget.DatePicker');
-            const spinner = control?._timeSpinner;
-            const value = parts.map(value => String(value).padStart(2, '0')).join(':');
-            if (!spinner) {
-                const inputs = [...picker.querySelectorAll('.spinner-block input')].filter(input => input.getClientRects().length);
-                return inputs.length === 1 && inputs[0].value.trim() === value;
-            }
-            const [hours, minutes, seconds] = parts;
-            const fields = {hours, minutes, seconds};
-            if (!Object.entries(fields).every(([key, value]) => spinner.get(key) === value)) {
-                spinner.set(fields);
-            }
-            return Object.entries(fields).every(([key, value]) => spinner.get(key) === value);
-        }""", [expected.hour, expected.minute, expected.second])
-        if not time_ok:
-            raise RuntimeError("未能确认日历里的失效时分秒，未提交发码。")
-        calendar.locator(".button-block").get_by_text(re.compile(r"^(确定|OK)$")).click(timeout=5000)
-        calendar.wait_for(state="hidden", timeout=6000)
-        values = trigger.evaluate(r"""trigger => {
-            const control = window.dorado?.widget?.Control?.findParentControl?.(trigger, 'dorado.widget.DateTimeSpinner');
-            const date = control?.get('value');
-            if (date instanceof Date) {
-                const pad = value => String(value).padStart(2, '0');
-                return [[date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join('-')
-                    + ' ' + [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':')];
-            }
-            for (let node = trigger.parentElement; node && !node.matches('.d-dialog, [role=dialog]'); node = node.parentElement) {
-                const values = [...node.querySelectorAll('input')].map(input => input.value.trim())
-                    .filter(value => /^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2}$/.test(value));
-                if (values.length) return values;
-            }
-            return [];
-        }""")
-        try:
-            matches = len(values) == 1 and datetime.strptime(values[0].replace("/", "-"), "%Y-%m-%d %H:%M:%S") == expected
-        except ValueError:
-            matches = False
-        if not matches:
-            raise RuntimeError(f"失效时间未能确认为 {self.expire_date_str}，未提交发码。")
-
-    def fill_generation_expiry(self, field):
-        expected = datetime.fromisoformat(self.expire_date_str)
-        input_type = field.get_attribute("type")
-        value = self.expire_date_str
-        if input_type == "datetime-local":
-            value = expected.isoformat(timespec="seconds" if expected.second else "minutes")
-        if input_type == "date":
-            if expected.time() != datetime.min.time():
-                raise RuntimeError("后台失效时间控件只支持日期，无法设置指定的时分秒。")
-            value = expected.date().isoformat()
-
-        def matches(value):
-            try:
-                value = value.strip()
-                return (input_type == "date" or ":" in value) and datetime.fromisoformat(value) == expected
-            except (ValueError, AttributeError):
-                return False
-
-        if field.is_editable():
-            field.fill(value, timeout=5000)
-            field.press("Tab")
-        if matches(field.input_value()):
+        if existing_cards:
+            self.log(f"检测到当前活动已包含 {len(existing_cards)} 笔激活码记录，直接使用已有记录，避免重复生成。", "INFO")
+            checkpoint["submitted"] = True
+            self.write_state(state)
             return
 
-        stored = field.evaluate("""(input, expiry) => {
-            const component = window.dorado?.widget?.Component;
-            if (typeof component?.get !== 'function') return null;
-            let editor;
-            for (let node = input; node && !node.matches('.d-dialog, [role=dialog]'); node = node.parentElement) {
-                let candidate;
-                try { candidate = component.get(node); } catch (_) { continue; }
-                if (candidate?._textDom === input || candidate?.getDom?.() === input) {
-                    editor = candidate;
-                    break;
-                }
-            }
-            if (typeof editor?.get !== 'function' || typeof editor.set !== 'function') return null;
-            const actual = editor.get('value');
-            const editorType = editor.constructor?.className || editor.constructor?.name || '';
-            if (!(actual instanceof Date) && !/Date(?:Time)?(?:Editor|Picker)/i.test(editorType)) return null;
-            const fields = expiry.split(/[- :]/).map(Number);
-            const requested = new Date(fields[0], fields[1] - 1, ...fields.slice(2));
-            if (actual?.getTime?.() !== requested.getTime()) {
-                editor.set('value', requested);
-                if (typeof editor.post === 'function') editor.post();
-            }
-            const stored = editor.get('value');
-            if (!(stored instanceof Date)) return null;
-            const pad = n => String(n).padStart(2, '0');
-            return [stored.getFullYear(), pad(stored.getMonth() + 1), pad(stored.getDate())].join('-')
-                + ' ' + [stored.getHours(), stored.getMinutes(), stored.getSeconds()].map(pad).join(':');
-        }""", self.expire_date_str)
-        if not matches(stored):
-            raise RuntimeError(f"失效时间未能确认为 {self.expire_date_str}，未提交发码。")
+        iso_expire = to_iso_expire_time(self.expire_date_str)
+        self.log(f"提交生成激活码参数: [生成数量={self.code_count}], [注册天数限制=0 (强制锁死默认)], [失效时间={self.expire_date_str}]...", "INFO")
 
-    def activate(self, ctx, activity_id, checkpoint, state):
-        self.select_activity(ctx, activity_id)
-        self.wait_for_empty_activation_list(ctx)
-        click_btn_by_text(ctx, "生成")
-        deadline = time.monotonic() + 12
-        dialog = None
-        while time.monotonic() < deadline and dialog is None:
-            for root in (ctx, ctx.page):
-                candidate = root.locator(
-                    "#d_dialogGenerateCode:visible, .d-dialog:visible:has-text('失效'), "
-                    "[role=dialog]:visible:has-text('失效')"
-                ).filter(has_text="数量").first
-                if candidate.is_visible():
-                    dialog = candidate
-                    break
-            if dialog is None:
-                ctx.wait_for_timeout(200)
-        if dialog is None:
-            raise RuntimeError("点击生成后，未找到激活码生成窗口。")
+        req_gen = {
+            "action": "remote-service",
+            "service": "activityPR#generateCode",
+            "parameter": {
+                "count": self.code_count,
+                "activityId": int(activity_id),
+                "regsterDays": 0,
+                "expireTime": iso_expire,
+            },
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        }
+        res_gen = self.post_view_service(req_gen)
+        if res_gen.get("data") != 1:
+            raise RuntimeError(f"生成激活码未返回成功标志，后台返回: {res_gen}")
 
-        self.fill_generation_fields(dialog)
-        submit = dialog.get_by_text(re.compile(r"^(确认|确定|提交)$"))
-        if submit.count() != 1:
-            raise RuntimeError("生成窗口未找到唯一的确认按钮。")
-        self.log(f"提交发码：{self.code_count} 个，注册天数 0，失效时间 {self.expire_date_str}")
+        self.log("激活码生成成功！", "SUCCESS")
         checkpoint["submitted"] = True
         self.write_state(state)
-        submit.click(timeout=10000)
 
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            self.exact_confirmation(ctx, "生成")
-            for root in (ctx, ctx.page):
-                success = root.locator(".d-message-box:visible, .d-dialog:visible").filter(
-                    has_text=re.compile("操作成功|生成成功")
-                ).first
-                if success.is_visible():
-                    okay = success.get_by_text("确定", exact=True)
-                    if okay.count() == 1:
-                        okay.click(timeout=3000)
-            listing = self.activation_list(ctx)
-            if not dialog.is_visible() and listing and (listing["populated"] or (listing["total"] or 0) > 0):
-                return
-            ctx.wait_for_timeout(250)
-        raise RuntimeError("已提交生成，后台尚未显示激活码。重试时只会核对并导出已有记录。")
-
-    def export(self, ctx, activity_id, tier):
-        self.select_activity(ctx, activity_id)
+    def export(self, activity_id: int, tier: str) -> List[Dict[str, str]]:
+        """
+        HTTP 直连获取生成的全部 100 个激活码，并导出保存单档位 xls 文件
+        """
         raw_directory = self.download_dir / "exports"
-        raw_directory.mkdir(exist_ok=True)
+        raw_directory.mkdir(parents=True, exist_ok=True)
         path = raw_directory / f"{tier}.xls"
-        with ctx.page.expect_download(timeout=30000) as download:
-            ctx.get_by_text(re.compile(r"^导出\s*Excel$")).first.click(timeout=10000)
-        download.value.save_as(str(path))
-        records = parse_single_export_file(str(path))
+
+        req_cards = {
+            "action": "load-data",
+            "dataProvider": "activityPR#loadNoviceCardsV1",
+            "supportsEntity": True,
+            "parameter": {"activityId": int(activity_id)},
+            "resultDataType": "v:com.ceapon.fire.gms.web.view.activity.NoviceCard$[NoviceCardV1]",
+            "pageSize": self.code_count,
+            "pageNo": 1,
+            "context": {},
+            "loadedDataTypes": LOADED_DATA_TYPES,
+        }
+        res_cards = self.post_view_service(req_cards)
+        card_data = res_cards.get("data", {})
+        cards = card_data.get("data", []) if isinstance(card_data, dict) else card_data
+
+        if len(cards) < self.code_count:
+            # 容错重试一次
+            time.sleep(1)
+            res_cards = self.post_view_service(req_cards)
+            card_data = res_cards.get("data", {})
+            cards = card_data.get("data", []) if isinstance(card_data, dict) else card_data
+
+        records = []
+        for card in cards:
+            c_code = str(card.get("code") or "").strip()
+            c_create = format_gms_time(card.get("createtime"))
+            c_expire = format_gms_time(card.get("expireTime"))
+            if c_code:
+                records.append({
+                    "code": c_code,
+                    "created_time": c_create,
+                    "expired_time": c_expire,
+                })
+
+        # 严格验证数据完整性与失效时间一致性
         validate_records(tier, records, self.code_count, self.expire_date_str)
+
+        # 写入标准的单档位 exports/{tier}.xls
+        book = xlwt.Workbook()
+        sheet = book.add_sheet(tier)
+        header = xlwt.easyxf("font: bold on; align: horiz center;")
+        headers = ["批次号", "激活码", "状态", "创建时间", "服务器名称", "角色ID", "角色名", "领取时间", "注册天数限制", "失效时间"]
+        for col_idx, h_text in enumerate(headers):
+            sheet.write(0, col_idx, h_text, header)
+
+        for row_idx, card in enumerate(cards, start=1):
+            sheet.write(row_idx, 0, str(card.get("batchNo") or ""))
+            sheet.write(row_idx, 1, str(card.get("code") or ""))
+            sheet.write(row_idx, 2, str(card.get("status") if card.get("status") is not None else 0))
+            sheet.write(row_idx, 3, format_gms_time(card.get("createtime")))
+            sheet.write(row_idx, 4, str(card.get("serverName") or ""))
+            sheet.write(row_idx, 5, str(card.get("pid") if card.get("pid") is not None else 0))
+            sheet.write(row_idx, 6, str(card.get("playerName") or ""))
+            sheet.write(row_idx, 7, format_gms_time(card.get("usetime")))
+            sheet.write(row_idx, 8, str(card.get("regsterDays") if card.get("regsterDays") is not None else 0))
+            sheet.write(row_idx, 9, format_gms_time(card.get("expireTime")))
+
+        temp_path = path.with_suffix(".tmp")
+        book.save(str(temp_path))
+        temp_path.replace(path)
+
         return records
 
-    def execute(self, ctx, page):
+    def execute(self) -> str:
+        """执行完整自动化任务（创建活动、修改奖励、发码、导出汇总）"""
+        self.login_http()
+
         path = self.progress_dir / "progress.json"
         state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         plan = self.job["plan"]
-        pending = [f"{tier} 档 {row['name']}" for tier, value in plan["tiers"].items()
-                   for row in value["items"] if row.get("status") == "review"]
+
+        pending = [
+            f"{tier} 档 {row['name']}"
+            for tier, value in plan["tiers"].items()
+            for row in value["items"]
+            if row.get("status") == "review"
+        ]
         if pending:
             raise RuntimeError(f"以下奖励需要核对后才能配置：{'、'.join(pending)}")
+
+        # 阶段 1：创建并配置各档位活动
         activities = {}
         for index, (tier, expected) in enumerate(self.job["rewards"].items()):
-            self.set_progress(12 + index * 5, tier, "核对并配置档位")
+            self.set_progress(12 + index * 5, tier, f"正在核对并就绪档位 [{tier}]...")
             item = plan["tiers"][tier]
             checkpoint = state.setdefault(tier, {})
+
             if not checkpoint:
-                self.select_activity(ctx, item["source"]["id"])
-                if self.compare(expected, self.read_rewards(ctx)) != item["items"]:
+                current_rewards = self.read_rewards(item["source"]["id"])
+                if self.compare(expected, current_rewards) != item["items"]:
                     raise RuntimeError(f"{tier} 档的往期奖励已变化，请重新预览")
-            activity_id = self.ensure_target(ctx, item["source"], item["target"], checkpoint, state)
-            if not checkpoint.get("submitted") and self.apply_rewards(ctx, activity_id, expected):
-                page.reload(wait_until="domcontentloaded")
-                ctx = self.open_gift_code_page(page)
-            self.select_activity(ctx, activity_id)
-            differences = [d for d in self.compare(expected, self.read_rewards(ctx)) if not d["matched"]]
+
+            activity_id = self.ensure_target(item["source"], item["target"], checkpoint, state)
+
+            if not checkpoint.get("submitted"):
+                self.apply_rewards(activity_id, expected)
+
+            # 严格复核奖励是否 100% 一致
+            current_after = self.read_rewards(activity_id)
+            differences = [d for d in self.compare(expected, current_after) if not d["matched"]]
             if differences:
                 raise RuntimeError(f"{tier} 档保存后仍存在奖励差异：{', '.join(d['name'] for d in differences)}")
+
+            self.log(f"✅ 档位 [{tier}] 奖励配置核验通过：与上传表格配置 100% 一致！", "SUCCESS")
             activities[tier] = {"id": activity_id, "name": item["target"]}
 
+        # 阶段 2：逐档发码并导出
         results = {}
         for index, (tier, activity) in enumerate(activities.items()):
-            self.set_progress(54 + index * 5, tier, "核验并生成礼包码")
+            self.set_progress(54 + index * 5, tier, f"正在生成并导出档位 [{tier}] 礼包码...")
             activity_id = activity["id"]
-            self.select_activity(ctx, activity_id)
-            expected = self.job["rewards"][tier]
-            if any(not item["matched"] for item in self.compare(expected, self.read_rewards(ctx))):
-                raise RuntimeError(f"{tier} 档发码前校验发现后台奖励已经变化")
             checkpoint = state[tier]
+
+            # 发码前再次复核奖励
+            current_before_gen = self.read_rewards(activity_id)
+            if any(not item["matched"] for item in self.compare(self.job["rewards"][tier], current_before_gen)):
+                raise RuntimeError(f"{tier} 档发码前校验发现后台奖励已经变化！")
+
             if not checkpoint.get("submitted"):
-                self.activate(ctx, activity_id, checkpoint, state)
-            results[tier] = self.export(ctx, activity_id, tier)
-            self.log(f"{tier} 档核验完成，已导出 {len(results[tier])} 个礼包码")
+                self.activate(activity_id, checkpoint, state)
+
+            results[tier] = self.export(activity_id, tier)
+            self.log(f"档位 [{tier}] 成功导出 {len(results[tier])} 个礼包码！", "SUCCESS")
+
+        # 阶段 3：合并生成单一汇总文件并记录完成
+        self.set_progress(95, "合并导出", "正在生成最终多档位汇总表格...")
         name = self.job["activity_name"]
-        result = write_xls(self.download_dir, name, results, self.code_count, self.expire_date_str)
+        final_file = write_xls(self.download_dir, name, results, self.code_count, self.expire_date_str)
+
         completed = self.download_dir / "completed.json"
         temporary = completed.with_suffix(".tmp")
-        temporary.write_text(json.dumps({
-            "name": name, "batch_date": self.job["batch_date"], "activities": activities,
-        }, ensure_ascii=False), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "batch_date": self.job["batch_date"],
+                    "activities": activities,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         temporary.replace(completed)
-        return result
 
-    def run(self, mode):
-        session = Path(self.work_dir) / "session_state.json"
-        with sync_playwright() as playwright:
-            import sys
-            is_headless = os.environ.get("HEADLESS", "").lower() in ("1", "true") or (sys.platform != "win32" and not os.environ.get("DISPLAY"))
-            self._is_headless = is_headless
-            launch_args = ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"]
-            if not is_headless:
-                launch_args.append("--start-maximized")
-            browser = playwright.chromium.launch(headless=is_headless, slow_mo=0 if is_headless else 400, args=launch_args)
-            if self.on_browser:
-                self.on_browser(browser)
+        self.set_progress(100, "完成", "所有档位礼包码生成并导出完成！")
+        self.log(f"🎉 全部 8 个档位礼包码自动化配置完成！汇总文件已保存至: {final_file}", "SUCCESS")
+        return final_file
+
+    def run(self, mode: str):
+        """外部统一入口"""
+        if self.job.get("credentials"):
             try:
-                options = {
-                    "locale": "zh-CN",
-                    "accept_downloads": True,
-                    "viewport": {"width": 1920, "height": 1080},
-                }
-                if session.exists() and not self.job.get("credentials"):
-                    try:
-                        options["storage_state"] = json.loads(session.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        pass
-                context = browser.new_context(**options)
-                page = context.new_page()
-                try:
-                    page.set_viewport_size({"width": 1920, "height": 1080})
-                except Exception:
-                    pass
-                page.bring_to_front()
-                self.login(page, context)
-                ctx = self.open_gift_code_page(page)
-                if self.job.get("credentials"):
-                    try:
-                        save_credentials(self.username, self.password)
-                    except OSError as exc:
-                        if getattr(exc, "winerror", None) != 1312:
-                            raise
-                        self.log("当前 Windows 会话无法保存密码，将继续使用已登录的 GMS 会话。", "WARN")
-                return self.preview(ctx) if mode == "preview" else self.execute(ctx, page)
-            finally:
-                if self.on_browser:
-                    self.on_browser(None)
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                save_credentials(self.username, self.password)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1312:
+                    raise
+                self.log("当前 Windows 会话无法保存密码，将继续使用已验证的 GMS 会话。", "WARN")
+
+        if mode == "preview":
+            return self.preview()
+        elif mode == "execute":
+            return self.execute()
+        else:
+            raise ValueError(f"未知运行模式: {mode}")
